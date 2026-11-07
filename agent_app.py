@@ -18,9 +18,10 @@ from openai import APIConnectionError, AsyncOpenAI
 from agenthack import AgentRuntime, BaseAgent
 from agenthack.telemetry import task
 from model_policy import request_budget
-from semantic_model import generate_record
 from semantic_agent import (PACKET_PREFIX, SourceView, byte_size, encode_for_transport,
-                            pack_source, refine_record, unpack_source)
+                            pack_source, unpack_source)
+from semantic_receiver import generate_adaptive_record
+from semantic_guide import decode_guide, validated_guide
 
 from wire import (
     ACK_FRAME,
@@ -34,6 +35,7 @@ from wire import (
     BlockDecoder,
     COMPRESSED_DATA_FRAME,
     DATA_FRAME,
+    GUIDE_FRAME,
     META,
     META_FRAME,
     FrameError,
@@ -62,6 +64,11 @@ MAX_BATCH_ATTEMPTS = 5
 SENDER_BUDGET_BYTES = 15 * 1024 * 1024
 RECEIVER_BUDGET_BYTES = 1 * 1024 * 1024
 MAX_CHUNKS = 65536
+# A partial reconstruction is a real model workflow (several parallel
+# requests plus an optional critic), so leave it a generous window instead of
+# waiting until the last half of the transport deadline.  The 8-second
+# finalization reserve in model_policy.py is deducted separately.
+PARTIAL_MODEL_WINDOW_SECONDS = 90.0
 MODEL_NAME = os.getenv("PLATFORM_MODEL_NAME", os.getenv("MODEL_NAME", "deepseek_v4"))
 
 
@@ -88,11 +95,15 @@ class ReceiverTask:
     transport_mode: Optional[str] = None
     block_count: Optional[int] = None
     block_decoder: Optional[BlockDecoder] = None
+    guide: dict = field(default_factory=dict)
     status: str = "pending"
     content: Optional[str] = None
     error: Optional[str] = None
     udp_bytes_sent: int = 0
     model_task: Optional[asyncio.Task] = None
+    # True while the currently published candidate was made from incomplete
+    # source.  A complete source arriving later is allowed to supersede it.
+    partial_result: bool = False
     finalize_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -167,6 +178,22 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
         try:
             frame = decode_frame(data)
         except FrameError:
+            return
+        if frame.kind == GUIDE_FRAME:
+            try:
+                guide = decode_guide(frame.payload)
+            except ValueError:
+                return
+            state = self.tasks.get(frame.task_id)
+            if state is None:
+                state = ReceiverTask(frame.task_id, 1)
+                self.tasks[frame.task_id] = state
+            if state.status not in ("success", "error"):
+                def rank(value):
+                    return len(value.get("anchors", [])) + len(value.get("entities", [])) + bool(value.get("layout"))
+                if (state.guide.get("source_sha256") != guide["source_sha256"]
+                        or rank(guide) >= rank(state.guide)):
+                    state.guide = guide
             return
         if frame.kind not in (META_FRAME, DATA_FRAME, COMPRESSED_DATA_FRAME, ACK_QUERY_FRAME,
                               BLOCK_META_FRAME, BLOCK_DATA_FRAME):
@@ -312,8 +339,6 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
         state.udp_bytes_sent += len(packet)
 
     def _maybe_complete(self, state):
-        if state.status in ("success", "error") or state.model_task is not None:
-            return
         if state.expected_bytes is None or state.digest is None:
             return
         if len(state.chunks) != state.total_chunks:
@@ -329,12 +354,42 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             state.status = "error"
             state.error = "invalid_utf8"
             return
+
+        # A partial model failure should not discard a source that completed
+        # during or just after that failed attempt.  Retry once on the now
+        # complete source while keeping ordinary transport/model errors final.
+        if state.status == "error":
+            if state.partial_result:
+                state.status = "processing"
+                state.partial_result = False
+                state.model_task = asyncio.create_task(
+                    self._generate(state, content, partial=False))
+            return
+
+        # A partial result may have been published just before the final
+        # retransmission arrived.  Re-open the task and let the complete
+        # source get one grounded model pass; this replaces the provisional
+        # result without starting duplicate upgrades for later duplicate UDP
+        # frames.
+        if state.status == "success":
+            if state.partial_result:
+                state.status = "processing"
+                state.partial_result = False
+                state.model_task = asyncio.create_task(
+                    self._generate(state, content, partial=False))
+            return
+        if state.model_task is not None:
+            return
         state.status = "processing"
+        state.partial_result = False
         state.model_task = asyncio.create_task(self._generate(state, content, partial=False))
 
     async def _partial_at_deadline(self, state):
         deadline = state.deadline_at or (state.created_at + 150)
-        delay = max(0, (deadline - time.monotonic()) * 0.55)
+        # Keep a fixed, generous model window.  The previous proportional
+        # delay left only ~46 seconds on a 120-second instance, which is too
+        # little for several concurrent Gateway requests under load.
+        delay = max(0, deadline - time.monotonic() - PARTIAL_MODEL_WINDOW_SECONDS)
         await asyncio.sleep(delay)
         async with state.lock:
             if state.status in ("success", "error") or state.model_task is not None:
@@ -348,6 +403,7 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             if not text:
                 return
             state.status = "processing"
+            state.partial_result = True
             state.model_task = asyncio.create_task(self._generate(state, text.encode("utf-8"), partial=True))
 
     async def _generate(self, state, raw, partial):
@@ -360,18 +416,22 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
                 with task() as span:
                     primary_error = None
                     try:
-                        result = await call_model(text, partial, state.deadline_at)
+                        result = await call_model(text, partial, state.deadline_at,
+                                                  guide_provider=lambda: state.guide)
                     except Exception as exc:
                         if not partial:
                             raise
                         primary_error = exc
                         result = None
+                    used_partial = partial
                     if partial and len(state.chunks) == state.total_chunks:
                         complete = state.assembled()
                         if (len(complete) == state.expected_bytes
                                 and hashlib.sha256(complete).digest() == state.digest):
                             try:
-                                result = await call_model(complete.decode("utf-8"), False, state.deadline_at)
+                                result = await call_model(complete.decode("utf-8"), False, state.deadline_at,
+                                                          guide_provider=lambda: state.guide)
+                                used_partial = False
                             except Exception as exc:
                                 logger.warning("late complete-source refinement unavailable: %s",
                                                type(exc).__name__)
@@ -385,6 +445,7 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             if time.monotonic() >= state.deadline_at:
                 raise TimeoutError("finalization_deadline_exceeded")
             state.content = result
+            state.partial_result = used_partial
             state.status = "success"
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
@@ -406,11 +467,12 @@ sender_protocol = None
 sender_transport = None
 sender_lock = asyncio.Lock()
 sender_jobs = set()
+sender_background_tasks = set()
 receiver_tasks = {}
 receiver_transport = None
 
 
-async def call_model(article_text, partial, deadline_at, purpose="receiver"):
+async def call_model(article_text, partial, deadline_at, purpose="receiver", guide_provider=None):
     base_url = os.getenv("PLATFORM_LLM_URL") or os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("PLATFORM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not base_url or not api_key:
@@ -421,22 +483,38 @@ async def call_model(article_text, partial, deadline_at, purpose="receiver"):
     async with AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=initial_budget,
                            max_retries=0) as client:
         async def request(messages, max_tokens, budget):
-            try:
-                async with asyncio.timeout(budget):
-                    response = await client.with_options(timeout=budget).chat.completions.create(
-                        model=MODEL_NAME,
-                        temperature=0,
-                        max_tokens=max_tokens,
-                        messages=messages,
-                    )
-            except APIConnectionError as exc:
-                raise ConnectionError("model_gateway_connection_failed") from exc
-            if not response.choices or response.choices[0].finish_reason != "stop":
-                raise RuntimeError("model_output_incomplete")
-            content = response.choices[0].message.content
-            if not isinstance(content, str) or not content.strip():
-                raise RuntimeError("model_returned_empty_output")
-            return content.strip()
+            # A length-terminated JSON response is not parseable reliably and
+            # a factual record may end in the middle of a number or negation.
+            # Retry once with a larger output ceiling while retaining the same
+            # absolute request budget; a second truncation is a hard failure
+            # and lets the caller choose an independent grounded path.
+            request_started = time.monotonic()
+            output_tokens = max(256, int(max_tokens))
+            for attempt in range(2):
+                try:
+                    remaining = max(0.05, budget - (time.monotonic() - request_started))
+                    async with asyncio.timeout(remaining):
+                        response = await client.with_options(timeout=remaining).chat.completions.create(
+                            model=MODEL_NAME,
+                            temperature=0,
+                            max_tokens=output_tokens,
+                            messages=messages,
+                        )
+                except APIConnectionError as exc:
+                    raise ConnectionError("model_gateway_connection_failed") from exc
+                if not response.choices:
+                    raise RuntimeError("model_output_incomplete")
+                choice = response.choices[0]
+                content = choice.message.content
+                if not isinstance(content, str) or not content.strip():
+                    raise RuntimeError("model_returned_empty_output")
+                if choice.finish_reason == "stop":
+                    return content.strip()
+                if choice.finish_reason != "length" or attempt:
+                    raise RuntimeError("model_output_truncated")
+                logger.warning("model output reached token limit; retrying with a larger output ceiling")
+                output_tokens = min(max(512, output_tokens * 2), 8192)
+            raise RuntimeError("model_output_truncated")
 
         if purpose == "sender":
             return await encode_for_transport(article_text, request, deadline_at)
@@ -446,11 +524,9 @@ async def call_model(article_text, partial, deadline_at, purpose="receiver"):
             if not partial:
                 raise
             source = SourceView(article_text, byte_size(article_text))
-        baseline = await generate_record(source.text, partial, deadline_at, request,
-                                         allow_verbatim=source.encoded)
-        if len(source.text) > 200 and byte_size(baseline) > source.original_bytes * 0.32:
-            return await refine_record(source.text, baseline, request, deadline_at, source.original_bytes)
-        return baseline
+        return await generate_adaptive_record(source.text, partial, deadline_at, request,
+            encoded=source.encoded,
+            guide_provider=lambda: validated_guide(guide_provider() if guide_provider else {}, source.text))
 
 
 def send_packet(protocol, packet):
@@ -584,17 +660,19 @@ async def send_article(task_id, article, chunk_size, deadline_ms, accepted_at=No
 
 
 async def sender_job(task_id, article, chunk_size, deadline_ms, accepted_at):
+    deadline_at = accepted_at + deadline_ms / 1000
+
     try:
         with telemetry.session(task_id, "sender_transport", os.getenv("CHALLENGE_SESSION_ID")):
             with task() as span:
                 raw_payload = (pack_source(article.decode("utf-8"), len(article), encoded=False).encode("utf-8")
                                if article.startswith(PACKET_PREFIX.encode("ascii")) else article)
                 payload = raw_payload
-                remaining = accepted_at + deadline_ms / 1000 - time.monotonic()
+                remaining = deadline_at - time.monotonic()
                 mode = os.getenv("SEMANTIC_MODE", "aggressive").strip().lower()
                 if mode != "lossless" and len(article) >= 1024 and remaining > 30:
                     try:
-                        encoding_deadline = time.monotonic() + remaining * 0.48
+                        encoding_deadline = time.monotonic() + remaining * 0.40
                         candidate = await call_model(article.decode("utf-8"), False,
                                                      encoding_deadline, purpose="sender")
                         raw_plan = build_transmission_plan(task_id, raw_payload, chunk_size, SEND_WINDOW)
@@ -605,8 +683,8 @@ async def sender_job(task_id, article, chunk_size, deadline_ms, accepted_at):
                         else:
                             payload = candidate
                     except Exception as exc:
-                        payload = raw_payload
-                        logger.warning("sender agent action=lossless_fallback reason=%s", type(exc).__name__)
+                        logger.warning("sender semantic encoding unavailable task=%s reason=%s",
+                                       task_id, type(exc).__name__)
                 await send_article(task_id, payload, chunk_size, deadline_ms, accepted_at)
                 span.result({"task_id": task_id, "article_bytes": len(article),
                              "transport_source_bytes": len(payload), "semantic_encoded": payload != raw_payload})
@@ -655,6 +733,10 @@ async def shutdown():
     if receiver_transport is not None:
         receiver_transport.close()
     pending_jobs = []
+    for pending in sender_background_tasks:
+        if not pending.done():
+            pending.cancel()
+            pending_jobs.append(pending)
     if peer_resolver_task is not None and not peer_resolver_task.done():
         peer_resolver_task.cancel()
         pending_jobs.append(peer_resolver_task)
@@ -702,7 +784,9 @@ async def send(request: Request):
     if task_id in sender_jobs:
         raise HTTPException(status_code=409, detail={"error": "task_already_accepted"})
     sender_jobs.add(task_id)
-    asyncio.create_task(sender_job(task_id, article, chunk_size, deadline_ms, time.monotonic()))
+    background = asyncio.create_task(sender_job(task_id, article, chunk_size, deadline_ms, time.monotonic()))
+    sender_background_tasks.add(background)
+    background.add_done_callback(sender_background_tasks.discard)
     return JSONResponse(status_code=202, content={"accepted": True, "task_id": task_id})
 
 

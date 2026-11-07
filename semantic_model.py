@@ -92,7 +92,7 @@ FACT_PROMPT = (
 )
 
 
-async def generate_record(article, partial, deadline_at, request, allow_verbatim=False):
+async def generate_record(article, partial, deadline_at, request, allow_verbatim=False, audit=True):
     """request(messages, max_tokens, budget) must return a complete model response."""
     initial_budget = request_budget(deadline_at)
     sources = split_source(article)
@@ -191,6 +191,11 @@ async def generate_record(article, partial, deadline_at, request, allow_verbatim
     if not all(detailed) and backup is None:
         raise RuntimeError("no_complete_model_coverage")
     records = [record or backup[i] for i, record in enumerate(detailed)]
+    if not audit:
+        result = "\n".join(records)
+        if not allow_verbatim and is_verbatim(article, result):
+            raise RuntimeError("model_returned_source_verbatim")
+        return result
     # A small patch audit preserves the usable candidate if verification is slow or malformed.
     try:
         audit_budget = request_budget(deadline_at, fraction=0.5)

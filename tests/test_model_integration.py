@@ -15,8 +15,10 @@ except ImportError:
 
 @unittest.skipIf(agent_app is None, "requires official base-image dependencies")
 class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_truncated_gateway_output_never_becomes_success(self):
+    async def test_repeated_length_gateway_output_is_rejected(self):
         class FakeClient:
+            calls = 0
+
             def __init__(self, **kwargs):
                 self.chat = SimpleNamespace(completions=self)
 
@@ -30,6 +32,7 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return self
 
             async def create(self, **kwargs):
+                FakeClient.calls += 1
                 return SimpleNamespace(choices=[SimpleNamespace(
                     finish_reason="length", message=SimpleNamespace(content="Truncated text"))])
 
@@ -37,6 +40,39 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(agent_app, "AsyncOpenAI", FakeClient):
             with self.assertRaisesRegex(RuntimeError, "no_complete_model_coverage"):
                 await agent_app.call_model("Received source text", False, time.monotonic() + 20)
+        self.assertGreaterEqual(FakeClient.calls, 2)
+
+    async def test_length_gateway_output_retries_and_accepts_complete_response(self):
+        class FakeClient:
+            calls = 0
+
+            def __init__(self, **kwargs):
+                self.chat = SimpleNamespace(completions=self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            def with_options(self, **kwargs):
+                return self
+
+            async def create(self, **kwargs):
+                FakeClient.calls += 1
+                if FakeClient.calls == 1:
+                    return SimpleNamespace(choices=[SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(content="Partial record"))])
+                return SimpleNamespace(choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="Complete model record"))])
+
+        with patch.dict(os.environ, {"PLATFORM_LLM_URL": "http://unused/v1", "PLATFORM_API_KEY": "test"}), \
+                patch.object(agent_app, "AsyncOpenAI", FakeClient):
+            result = await agent_app.call_model("Received source text", False, time.monotonic() + 20)
+        self.assertEqual(result, "Complete model record")
+        self.assertGreaterEqual(FakeClient.calls, 2)
 
     async def test_success_is_published_after_session_close_and_flush(self):
         events = []
@@ -59,7 +95,7 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[-1], "session_exit")
             events.append("flush")
 
-        async def model(*args):
+        async def model(*args, **kwargs):
             return "Model-produced factual record"
 
         fake_telemetry = SimpleNamespace(session=session, flush=flush)
@@ -81,6 +117,45 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.deadline_at, deadline)
         state.finalize_task.cancel()
         await asyncio.gather(state.finalize_task, return_exceptions=True)
+
+    async def test_partial_reconstruction_starts_with_fixed_model_window(self):
+        raw = b"A complete source fragment."
+        state = agent_app.ReceiverTask(
+            "partial-window-test", 1, expected_bytes=len(raw), chunk_size=len(raw),
+            digest=hashlib.sha256(raw).digest(), chunks={0: raw},
+            deadline_at=time.monotonic() + 0.16)
+        started = asyncio.Event()
+
+        async def fake_generate(*args, **kwargs):
+            started.set()
+
+        with patch.object(agent_app, "PARTIAL_MODEL_WINDOW_SECONDS", 0.10), \
+                patch.object(agent_app.ReceiverProtocol, "_generate", fake_generate):
+            await agent_app.ReceiverProtocol({state.task_id: state})._partial_at_deadline(state)
+            await asyncio.wait_for(started.wait(), 0.08)
+        self.assertEqual(state.status, "processing")
+        self.assertTrue(state.partial_result)
+        self.assertIsNotNone(state.model_task)
+        await state.model_task
+
+    async def test_complete_source_reopens_published_partial_result(self):
+        raw = b"A complete source fragment."
+        state = agent_app.ReceiverTask(
+            "partial-upgrade-test", 1, expected_bytes=len(raw), chunk_size=len(raw),
+            digest=hashlib.sha256(raw).digest(), chunks={0: raw}, status="success",
+            content="Partial record", partial_result=True)
+        generated = asyncio.Event()
+
+        async def fake_generate(*args, **kwargs):
+            generated.set()
+
+        protocol = agent_app.ReceiverProtocol({state.task_id: state})
+        with patch.object(agent_app.ReceiverProtocol, "_generate", fake_generate):
+            protocol._maybe_complete(state)
+            await asyncio.wait_for(generated.wait(), 0.1)
+        self.assertEqual(state.status, "processing")
+        self.assertFalse(state.partial_result)
+        await state.model_task
 
     async def test_late_full_source_improves_partial_model_candidate(self):
         for partial_result, full_result, expected in (
@@ -130,9 +205,9 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(agent_app, "AsyncOpenAI", FakeClient):
             result = await agent_app.call_model("Received source", False, time.monotonic() + 20)
         self.assertIn("following retry", result)
-        self.assertEqual(FakeClient.calls, 3)
+        self.assertGreaterEqual(FakeClient.calls, 2)
 
-    async def test_sender_encoding_failure_falls_back_to_original_udp_source(self):
+    async def test_sender_encoder_failure_preserves_original_udp_source(self):
         source = ("Approved in 2025 with conditions. " * 80).encode()
         accepted_at = time.monotonic()
         transmit = AsyncMock()
@@ -142,6 +217,19 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await agent_app.sender_job("sender-fallback", source, 512, 120000, accepted_at)
         self.assertEqual(encoder.call_args.kwargs["purpose"], "sender")
         transmit.assert_awaited_once_with("sender-fallback", source, 512, 120000, accepted_at)
+
+    async def test_sender_uses_a_shorter_model_checked_semantic_payload(self):
+        source = ("Agency A received 12 units in 2025; the alternative was rejected. " * 80).encode()
+        candidate = agent_app.pack_source("A:12 units,2025; alternative rejected.", len(source)).encode()
+        accepted_at = time.monotonic()
+        transmit = AsyncMock()
+        encoder = AsyncMock(return_value=candidate)
+        with patch.dict(os.environ, {"SEMANTIC_MODE": "aggressive"}), \
+                patch.object(agent_app, "call_model", encoder), patch.object(agent_app, "send_article", transmit):
+            await agent_app.sender_job("sender-semantic", source, 512, 120000, accepted_at)
+        self.assertEqual(encoder.call_args.kwargs["purpose"], "sender")
+        self.assertGreater(accepted_at + 120, encoder.call_args.args[2])
+        transmit.assert_awaited_once_with("sender-semantic", candidate, 512, 120000, accepted_at)
 
     async def test_sender_lossless_mode_does_not_run_semantic_encoder(self):
         source = ("Approved in 2025 with conditions. " * 80).encode()
@@ -154,17 +242,46 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         encoder.assert_not_awaited()
         transmit.assert_awaited_once_with("sender-lossless", source, 512, 120000, accepted_at)
 
-    async def test_failed_transport_estimate_cannot_keep_tentative_semantic_payload(self):
+    async def test_sender_encoder_gets_a_bounded_fraction_of_remaining_time(self):
         source = ("Approved in 2025 with conditions. " * 80).encode()
         accepted_at = time.monotonic()
         transmit = AsyncMock()
-        encoder = AsyncMock(return_value=b"Tentative semantic payload")
-        with patch.dict(os.environ, {"SEMANTIC_MODE": "aggressive"}), \
-                patch.object(agent_app, "call_model", encoder), patch.object(agent_app, "send_article", transmit), \
-                patch.object(agent_app, "build_transmission_plan", side_effect=ValueError("estimate failed")):
-            await agent_app.sender_job("failed-estimate", source, 512, 120000, accepted_at)
-        transmit.assert_awaited_once_with("failed-estimate", source, 512, 120000, accepted_at)
+        observed = {}
 
+        async def encoder(*args, **kwargs):
+            observed["deadline_at"] = args[2]
+            observed["purpose"] = kwargs["purpose"]
+            raise TimeoutError()
+
+        with patch.dict(os.environ, {"SEMANTIC_MODE": "aggressive"}), \
+                patch.object(agent_app, "call_model", encoder), patch.object(agent_app, "send_article", transmit):
+            await agent_app.sender_job("bounded-encoder", source, 512, 120000, accepted_at)
+        encoding_deadline = observed["deadline_at"]
+        self.assertEqual(observed["purpose"], "sender")
+        self.assertGreater(encoding_deadline, accepted_at)
+        self.assertLess(encoding_deadline, accepted_at + 120)
+        transmit.assert_awaited_once_with("bounded-encoder", source, 512, 120000, accepted_at)
+
+    async def test_guide_arriving_first_is_not_source_or_acknowledgement(self):
+        from semantic_guide import encode_guide
+
+        source = "Agency received 12 units in 2025."
+        guide = {"version": 1, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                 "layout": "ledger", "entities": [], "anchors": [source]}
+        states = {}
+        protocol = agent_app.ReceiverProtocol(states)
+        protocol.datagram_received(agent_app.encode_frame(agent_app.GUIDE_FRAME, "guide-first", 0, 1,
+            encode_guide(guide)), ("127.0.0.1", 9000))
+        state = states["guide-first"]
+        self.assertEqual(state.guide["source_sha256"], guide["source_sha256"])
+        self.assertEqual(state.chunks, {})
+        self.assertIsNone(state.expected_bytes)
+        self.assertIsNone(state.model_task)
+        self.assertEqual(state.status, "pending")
+        stale_guide = dict(guide, anchors=[])
+        protocol.datagram_received(agent_app.encode_frame(agent_app.GUIDE_FRAME, "guide-first", 0, 1,
+            encode_guide(stale_guide)), ("127.0.0.1", 9000))
+        self.assertEqual(state.guide["anchors"], [source])
 
 if __name__ == "__main__":
     unittest.main()

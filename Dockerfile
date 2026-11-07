@@ -5,7 +5,7 @@ ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
 ENV AGENT_ROLE=${AGENT_ROLE}
 WORKDIR /app
-COPY --chown=agent:agent wire.py model_policy.py semantic_model.py semantic_agent.py agent_app.py ./
+COPY --chown=agent:agent wire.py model_policy.py semantic_model.py semantic_agent.py semantic_receiver.py semantic_guide.py agent_app.py ./
 USER agent
 EXPOSE 8080/tcp 9000/udp
 CMD ["python", "/app/agent_app.py"]

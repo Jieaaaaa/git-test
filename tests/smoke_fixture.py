@@ -10,7 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-stats = {"model_calls": 0, "sender_model_calls": 0, "udp_bytes": 0, "max_datagram": 0, "dropped": 0,
+stats = {"model_calls": 0, "sender_model_calls": 0, "guide_packets": 0, "udp_bytes": 0, "max_datagram": 0, "dropped": 0,
          "data_dropped": 0, "ack_dropped": 0}
 lock = threading.Lock()
 
@@ -32,7 +32,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         system, user = [message["content"] for message in body["messages"]]
-        if "You verify a semantic" in system:
+        if "entity/layout planner" in system:
+            content = '{"layout":"ledger","entities":[]}'
+        elif "fragile-fact sentinel" in system:
+            content = json.dumps({"anchors": ["Agency0 received 100 units in 2025."]})
+        elif "You verify a semantic" in system:
             verdict = "reject" if os.getenv("SMOKE_CRITIC_REJECT") == "1" else "accept"
             content = json.dumps({"verdict": verdict, "repairs": [], "risk": "local fixture decision"})
         elif "sending semantic communication agent" in system:
@@ -46,13 +50,20 @@ class Handler(BaseHTTPRequestHandler):
         elif "independent, concise coverage" in system:
             pieces = re.split(r"SECTION \d+:\n", user)[1:]
             content = json.dumps({"records": [encode_facts(piece) for piece in pieces]})
+        elif "receiving semantic compiler" in system:
+            source = user.split("SOURCE (", 1)[1].split("\n\nSOURCE-ALIGNED", 1)[0]
+            source = source.split("bytes):\n", 1)[1]
+            content = encode_facts(source)
         else:
             target = user.split("TARGET SECTION:\n", 1)[1].split("\nFOLLOWING CONTEXT", 1)[0]
             content = encode_facts(target)
+            if "compact factual record" not in system:
+                content += " The report records those agency decisions and their rejected alternatives."
         time.sleep(0.1)
         with lock:
             stats["model_calls"] += 1
-            if "sending semantic communication agent" in system:
+            if ("entity/layout planner" in system or "fragile-fact sentinel" in system
+                    or "sending semantic communication agent" in system):
                 stats["sender_model_calls"] += 1
         self.respond({"id": "local-mock", "object": "chat.completion", "created": int(time.time()),
                       "model": body["model"], "choices": [{"index": 0, "finish_reason": "stop",
@@ -82,6 +93,9 @@ def relay(port, target, seed):
             stats["udp_bytes"] += len(data)
             stats["max_datagram"] = max(stats["max_datagram"], len(data))
         kind = data[5] if len(data) >= 6 else 0
+        if kind == 9:
+            with lock:
+                stats["guide_packets"] += 1
         force_data = os.getenv("SMOKE_DROP_DATA") == "1" and kind in (2, 5, 7) and not forced_data_drop
         force_ack = os.getenv("SMOKE_DROP_ACK") == "1" and kind in (4, 8) and not forced_ack_drop
         if force_data:

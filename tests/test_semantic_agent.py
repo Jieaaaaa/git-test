@@ -45,6 +45,30 @@ class GroundingTests(unittest.TestCase):
     def test_numeric_coverage_is_not_claimed_from_model_confidence(self):
         self.assertEqual(number_gaps("Approved 12 in 2025, not 20", "12 in 2025"), ["20"])
 
+    @unittest.skipIf(sys.version_info < (3, 11), "uses image Python 3.11")
+    def test_accepted_critic_allows_equivalent_date_and_thousands_format(self):
+        from semantic_agent import verify_candidate
+
+        source = "甲公司于２０２５年５月７日取得1,000.00万元；乙公司未获批。"
+        candidate = "甲公司:2025-5-7取得1000万元；乙公司:未获批。"
+
+        async def request(messages, tokens, budget):
+            return '{"verdict":"accept","repairs":[]}'
+
+        result, verdict = asyncio.run(verify_candidate(source, candidate, request, time.monotonic() + 20))
+        self.assertEqual((result, verdict), (candidate, "accept"))
+        self.assertEqual(number_gaps(source, candidate), [])
+
+    def test_numeric_normalization_still_detects_missing_real_value(self):
+        self.assertEqual(number_gaps("2025年5月7日取得1,000.00万元", "2025-5-7取得100万元"), ["1000"])
+
+    def test_equivalent_dates_separators_and_fullwidth_digits(self):
+        self.assertEqual(number_gaps("２０２５年５月７日，1,000.00元", "2025-5-7:1000元"), [])
+        self.assertEqual(number_gaps("2025-5-7: 1,200.50元", "2025年5月7日：1200.5元"), [])
+
+    def test_numeric_normalization_still_detects_changed_values(self):
+        self.assertEqual(number_gaps("1,200.50元", "1200元"), ["1200.5"])
+
 
 @unittest.skipIf(sys.version_info < (3, 11), "uses image Python 3.11")
 class SemanticAgentTests(unittest.IsolatedAsyncioTestCase):
@@ -82,13 +106,25 @@ class SemanticAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await refine_record(self.source, self.baseline, request, self.deadline()), self.baseline)
 
-    async def test_false_acceptance_with_missing_number_is_rejected(self):
+    async def test_model_critic_can_accept_a_nonmaterial_numeric_omission(self):
         async def request(messages, tokens, budget):
             if "You verify a semantic" in messages[0]["content"]:
                 return '{"verdict":"accept","repairs":[],"risk":"none"}'
             return '{"action":"propose","strategy":"short","content":"A:12 units; B:not approved"}'
 
-        self.assertEqual(await refine_record(self.source, self.baseline, request, self.deadline()), self.baseline)
+        result = await refine_record(self.source, self.baseline, request, self.deadline())
+        self.assertEqual(result, "A:12 units; B:not approved")
+
+    async def test_critic_repairs_a_material_numeric_omission_with_source_evidence(self):
+        async def request(messages, tokens, budget):
+            if "You verify a semantic" in messages[0]["content"]:
+                return json.dumps({"verdict": "repair", "repairs": [{"old": "", "new": "A received in 2025",
+                    "source_quote": "Agency A received 12 units in 2025"}], "risk": "missing date"})
+            return '{"action":"propose","strategy":"short","content":"A:12 units; B:not approved"}'
+
+        result = await refine_record(self.source, self.baseline, request, self.deadline())
+        self.assertIn("2025", result)
+        self.assertLess(byte_size(result), byte_size(self.baseline))
 
     async def test_false_acceptance_that_drops_all_negation_is_rejected(self):
         async def request(messages, tokens, budget):
@@ -137,8 +173,8 @@ class SemanticAgentTests(unittest.IsolatedAsyncioTestCase):
                 return '{"verdict":"accept","repairs":[],"risk":"none"}'
             turns += 1
             if turns == 1:
-                return '{"action":"propose","strategy":"ledger","content":"A:12 units; B:not approved"}'
-            self.assertIn("numeric_coverage_not_restored", messages[1]["content"])
+                return json.dumps({"action": "propose", "strategy": "ledger", "content": self.baseline})
+            self.assertIn("proposal_did_not_reduce_measured_bytes", messages[1]["content"])
             return '{"action":"propose","strategy":"dated ledger","content":"A:12 units,2025; B:not approved"}'
 
         result = await refine_record(self.source, self.baseline, request, self.deadline())

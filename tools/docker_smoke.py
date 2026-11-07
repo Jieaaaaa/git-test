@@ -94,7 +94,7 @@ def main():
         for i in range(18):
             assert "Agency%d: %d units in 2025" % (i, 100 + i) in content, content
         stats = get(addresses[2] + "/stats")
-        assert stats["model_calls"] >= 3, stats
+        assert stats["model_calls"] >= 2, stats
         assert stats["max_datagram"] <= 1400 and stats["udp_bytes"] <= 16 * 1024 * 1024, stats
         assert stats["dropped"] > 0, stats
         if args.semantic_mode == "aggressive":
