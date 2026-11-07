@@ -92,7 +92,7 @@ FACT_PROMPT = (
 )
 
 
-async def generate_record(article, partial, deadline_at, request):
+async def generate_record(article, partial, deadline_at, request, allow_verbatim=False):
     """request(messages, max_tokens, budget) must return a complete model response."""
     initial_budget = request_budget(deadline_at)
     sources = split_source(article)
@@ -131,7 +131,7 @@ async def generate_record(article, partial, deadline_at, request):
              + "Return only the factual record of the TARGET SECTION. Context resolves references only."},
             {"role": "user", "content": user},
         ], min(3600, max(900, math.ceil(len(sources[index]) * 1.5))))
-        if is_verbatim(sources[index], result):
+        if not allow_verbatim and is_verbatim(sources[index], result):
             raise ValueError("model_copied_source_section")
         return result.strip()
 
@@ -146,7 +146,7 @@ async def generate_record(article, partial, deadline_at, request):
             {"role": "user", "content": labeled_source},
         ], min(3600, max(900, math.ceil(len(article) * 0.65))))
         records = parse_coverage(result, len(sources))
-        if any(is_verbatim(source, record) for source, record in zip(sources, records)):
+        if not allow_verbatim and any(is_verbatim(source, record) for source, record in zip(sources, records)):
             raise ValueError("coverage_copied_source_section")
         return records
 
@@ -216,7 +216,7 @@ async def generate_record(article, partial, deadline_at, request):
     except Exception as exc:
         logger.warning("model patch audit unavailable; keeping completed records: %s", type(exc).__name__)
     result = "\n".join(records)
-    if is_verbatim(article, result):
+    if not allow_verbatim and is_verbatim(article, result):
         raise RuntimeError("model_returned_source_verbatim")
     logger.info("model record finalized source_bytes=%s result_bytes=%s detailed_sections=%s/%s elapsed=%.1fs",
                 len(article.encode("utf-8")), len(result.encode("utf-8")), sum(bool(x) for x in detailed),

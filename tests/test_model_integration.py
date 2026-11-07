@@ -132,6 +132,39 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("following retry", result)
         self.assertEqual(FakeClient.calls, 3)
 
+    async def test_sender_encoding_failure_falls_back_to_original_udp_source(self):
+        source = ("Approved in 2025 with conditions. " * 80).encode()
+        accepted_at = time.monotonic()
+        transmit = AsyncMock()
+        encoder = AsyncMock(side_effect=TimeoutError())
+        with patch.dict(os.environ, {"SEMANTIC_MODE": "aggressive"}), \
+                patch.object(agent_app, "call_model", encoder), patch.object(agent_app, "send_article", transmit):
+            await agent_app.sender_job("sender-fallback", source, 512, 120000, accepted_at)
+        self.assertEqual(encoder.call_args.kwargs["purpose"], "sender")
+        transmit.assert_awaited_once_with("sender-fallback", source, 512, 120000, accepted_at)
+
+    async def test_sender_lossless_mode_does_not_run_semantic_encoder(self):
+        source = ("Approved in 2025 with conditions. " * 80).encode()
+        accepted_at = time.monotonic()
+        transmit = AsyncMock()
+        encoder = AsyncMock()
+        with patch.dict(os.environ, {"SEMANTIC_MODE": "lossless"}), \
+                patch.object(agent_app, "call_model", encoder), patch.object(agent_app, "send_article", transmit):
+            await agent_app.sender_job("sender-lossless", source, 512, 120000, accepted_at)
+        encoder.assert_not_awaited()
+        transmit.assert_awaited_once_with("sender-lossless", source, 512, 120000, accepted_at)
+
+    async def test_failed_transport_estimate_cannot_keep_tentative_semantic_payload(self):
+        source = ("Approved in 2025 with conditions. " * 80).encode()
+        accepted_at = time.monotonic()
+        transmit = AsyncMock()
+        encoder = AsyncMock(return_value=b"Tentative semantic payload")
+        with patch.dict(os.environ, {"SEMANTIC_MODE": "aggressive"}), \
+                patch.object(agent_app, "call_model", encoder), patch.object(agent_app, "send_article", transmit), \
+                patch.object(agent_app, "build_transmission_plan", side_effect=ValueError("estimate failed")):
+            await agent_app.sender_job("failed-estimate", source, 512, 120000, accepted_at)
+        transmit.assert_awaited_once_with("failed-estimate", source, 512, 120000, accepted_at)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,11 +19,19 @@ from agenthack import AgentRuntime, BaseAgent
 from agenthack.telemetry import task
 from model_policy import request_budget
 from semantic_model import generate_record
+from semantic_agent import (PACKET_PREFIX, SourceView, byte_size, encode_for_transport,
+                            pack_source, refine_record, unpack_source)
 
 from wire import (
     ACK_FRAME,
     ACK_QUERY,
     ACK_QUERY_FRAME,
+    ACK_STATE,
+    ACK_STATE_FRAME,
+    BLOCK_DATA_FRAME,
+    BLOCK_META,
+    BLOCK_META_FRAME,
+    BlockDecoder,
     COMPRESSED_DATA_FRAME,
     DATA_FRAME,
     META,
@@ -36,6 +44,8 @@ from wire import (
     encode_frame,
     max_payload,
     compress_chunk,
+    build_transmission_plan,
+    MAX_SOURCE_BYTES,
 )
 
 logging.basicConfig(level=os.getenv("AGENTHACK_LOG_LEVEL", "INFO"))
@@ -75,6 +85,9 @@ class ReceiverTask:
     digest: Optional[bytes] = None
     deadline_at: Optional[float] = None
     chunks: Dict[int, bytes] = field(default_factory=dict)
+    transport_mode: Optional[str] = None
+    block_count: Optional[int] = None
+    block_decoder: Optional[BlockDecoder] = None
     status: str = "pending"
     content: Optional[str] = None
     error: Optional[str] = None
@@ -84,11 +97,17 @@ class ReceiverTask:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def assembled(self):
+        if self.transport_mode == "blocks":
+            if self.block_decoder is None or self.expected_bytes is None or self.block_count is None:
+                return b""
+            return self.block_decoder.assembled(self.expected_bytes, self.block_count)
         if self.chunk_size is None:
             return b""
         return b"".join(self.chunks[index] for index in sorted(self.chunks))
 
     def partial_content(self):
+        if self.transport_mode == "blocks":
+            return self.block_decoder.partial_content(self.expected_bytes) if self.block_decoder else b""
         segments = []
         current = bytearray()
         for index in range(self.total_chunks):
@@ -121,7 +140,7 @@ class SenderProtocol(asyncio.DatagramProtocol):
             frame = decode_frame(data)
         except FrameError:
             return
-        if frame.kind != ACK_FRAME:
+        if frame.kind not in (ACK_FRAME, ACK_STATE_FRAME):
             return
         queue = self.ack_queues.get(frame.task_id)
         if queue is not None:
@@ -149,7 +168,8 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             frame = decode_frame(data)
         except FrameError:
             return
-        if frame.kind not in (META_FRAME, DATA_FRAME, COMPRESSED_DATA_FRAME, ACK_QUERY_FRAME):
+        if frame.kind not in (META_FRAME, DATA_FRAME, COMPRESSED_DATA_FRAME, ACK_QUERY_FRAME,
+                              BLOCK_META_FRAME, BLOCK_DATA_FRAME):
             return
         if frame.total < 1 or frame.total > MAX_CHUNKS:
             return
@@ -159,22 +179,31 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             self.tasks[frame.task_id] = state
         if frame.kind == META_FRAME:
             self._on_meta(state, frame)
+        elif frame.kind == BLOCK_META_FRAME:
+            self._on_block_meta(state, frame)
+        elif frame.kind == BLOCK_DATA_FRAME:
+            self._on_block_data(state, frame)
         elif frame.kind in (DATA_FRAME, COMPRESSED_DATA_FRAME):
             self._on_data(state, frame)
         else:
             self._send_ack(state, frame)
 
     def _on_meta(self, state, frame):
+        if state.transport_mode == "blocks":
+            return
         if len(frame.payload) != META.size:
             return
         expected_bytes, deadline_ms, chunk_size, digest = META.unpack(frame.payload)
         expected_chunks = max(1, (expected_bytes + chunk_size - 1) // chunk_size) if chunk_size else 0
-        if not chunk_size or chunk_size > 1200 or frame.total != expected_chunks:
+        if (not chunk_size or chunk_size > 1200 or frame.total != expected_chunks
+                or expected_bytes > MAX_SOURCE_BYTES):
             return
         if any(index >= frame.total for index in state.chunks):
             return
-        if state.expected_bytes is not None and state.digest != digest:
+        if state.expected_bytes is not None and (state.digest != digest
+                or state.expected_bytes != expected_bytes or state.chunk_size != chunk_size):
             return
+        state.transport_mode = "legacy"
         state.total_chunks = frame.total
         state.expected_bytes = expected_bytes
         state.chunk_size = chunk_size
@@ -186,9 +215,11 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
         self._maybe_complete(state)
 
     def _on_data(self, state, frame):
+        if state.transport_mode == "blocks":
+            return
         if frame.sequence >= frame.total:
             return
-        if state.expected_bytes is not None and frame.total != state.total_chunks:
+        if (state.expected_bytes is not None or state.chunks) and frame.total != state.total_chunks:
             return
         state.total_chunks = frame.total
         try:
@@ -205,6 +236,56 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             state.chunks[frame.sequence] = payload
         elif old != payload:
             return
+        state.transport_mode = "legacy"
+        self._maybe_complete(state)
+
+    def _on_block_meta(self, state, frame):
+        if state.transport_mode == "legacy" or len(frame.payload) != BLOCK_META.size:
+            return
+        expected_bytes, deadline_ms, block_count, digest = BLOCK_META.unpack(frame.payload)
+        if not 1 <= expected_bytes <= MAX_SOURCE_BYTES or not 1 <= block_count <= frame.total:
+            return
+        if state.chunks and state.total_chunks != frame.total:
+            return
+        if state.block_decoder is not None and (state.block_decoder.total != frame.total
+                                                  or not state.block_decoder.within(expected_bytes)):
+            return
+        if state.expected_bytes is not None and (state.expected_bytes != expected_bytes
+                or state.digest != digest or state.block_count != block_count):
+            return
+        state.transport_mode = "blocks"
+        state.total_chunks = frame.total
+        state.expected_bytes = expected_bytes
+        state.block_count = block_count
+        state.digest = digest
+        if state.block_decoder is None:
+            state.block_decoder = BlockDecoder(frame.total)
+        incoming_deadline = time.monotonic() + max(1, deadline_ms) / 1000
+        state.deadline_at = min(state.deadline_at or incoming_deadline, incoming_deadline)
+        if state.finalize_task is None:
+            state.finalize_task = asyncio.create_task(self._partial_at_deadline(state))
+        self._maybe_complete(state)
+
+    def _on_block_data(self, state, frame):
+        if state.transport_mode == "legacy" or frame.sequence >= frame.total:
+            return
+        if state.chunks and frame.total != state.total_chunks:
+            return
+        if state.expected_bytes is not None and frame.total != state.total_chunks:
+            return
+        decoder = state.block_decoder
+        if decoder is None:
+            decoder = BlockDecoder(frame.total)
+        try:
+            decoder.add(frame, state.expected_bytes)
+        except FrameError:
+            for sequence in decoder.discard_incomplete(frame.sequence):
+                state.chunks.pop(sequence, None)
+            return
+        state.transport_mode = "blocks"
+        state.total_chunks = frame.total
+        state.block_decoder = decoder
+        state.chunks[frame.sequence] = frame.payload
         self._maybe_complete(state)
 
     def _send_ack(self, state, frame):
@@ -213,15 +294,16 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
         count = ACK_QUERY.unpack(frame.payload)[0]
         if count < 1 or count > 256:
             return
-        if state.expected_bytes is not None and frame.total != state.total_chunks:
+        if (state.expected_bytes is not None or state.chunks) and frame.total != state.total_chunks:
             return
         state.total_chunks = frame.total
         start = frame.sequence
         count = min(count, max(0, state.total_chunks - start))
         if count == 0:
             return
-        payload = ack_bitmap(state.chunks, start, count)
-        packet = encode_frame(ACK_FRAME, state.task_id, start, state.total_chunks, payload)
+        payload = ACK_STATE.pack(count, int(state.expected_bytes is not None))
+        payload += ack_bitmap(state.chunks, start, count)
+        packet = encode_frame(ACK_STATE_FRAME, state.task_id, start, state.total_chunks, payload)
         if state.udp_bytes_sent + len(packet) > RECEIVER_BUDGET_BYTES:
             return
         if UDP_PEER_ADDR is None:
@@ -328,7 +410,7 @@ receiver_tasks = {}
 receiver_transport = None
 
 
-async def call_model(article_text, partial, deadline_at):
+async def call_model(article_text, partial, deadline_at, purpose="receiver"):
     base_url = os.getenv("PLATFORM_LLM_URL") or os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("PLATFORM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not base_url or not api_key:
@@ -356,7 +438,19 @@ async def call_model(article_text, partial, deadline_at):
                 raise RuntimeError("model_returned_empty_output")
             return content.strip()
 
-        return await generate_record(article_text, partial, deadline_at, request)
+        if purpose == "sender":
+            return await encode_for_transport(article_text, request, deadline_at)
+        try:
+            source = unpack_source(article_text)
+        except ValueError:
+            if not partial:
+                raise
+            source = SourceView(article_text, byte_size(article_text))
+        baseline = await generate_record(source.text, partial, deadline_at, request,
+                                         allow_verbatim=source.encoded)
+        if len(source.text) > 200 and byte_size(baseline) > source.original_bytes * 0.32:
+            return await refine_record(source.text, baseline, request, deadline_at, source.original_bytes)
+        return baseline
 
 
 def send_packet(protocol, packet):
@@ -372,56 +466,71 @@ def make_data_packet(task_id, sequence, total, payload):
     return encode_frame(kind, task_id, sequence, total, encoded)
 
 
-async def await_batch_ack(protocol, task_id, start, count, timeout):
+async def await_batch_ack(protocol, task_id, start, count, timeout, total=None):
     queue = protocol.ack_queues[task_id]
-    end = start + count
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             frame = await asyncio.wait_for(queue.get(), deadline - time.monotonic())
         except asyncio.TimeoutError:
             return None
-        if frame.sequence == start and len(frame.payload) >= (count + 7) // 8:
-            return frame.payload
-        if start <= frame.sequence < end:
-            return frame.payload
+        if frame.sequence != start or (total is not None and frame.total != total):
+            continue
+        bitmap_bytes = (count + 7) // 8
+        if frame.kind == ACK_STATE_FRAME:
+            if len(frame.payload) != ACK_STATE.size + bitmap_bytes:
+                continue
+            received_count, flags = ACK_STATE.unpack_from(frame.payload)
+            if received_count != count or flags not in (0, 1):
+                continue
+            return frame.payload[ACK_STATE.size:], bool(flags)
+        if frame.kind == ACK_FRAME and len(frame.payload) == bitmap_bytes:
+            return frame.payload, True
     return None
 
 
 async def send_article(task_id, article, chunk_size, deadline_ms, accepted_at=None):
     if sender_protocol is None or sender_protocol.transport is None:
         raise RuntimeError("sender_udp_not_ready")
-    usable = max_payload(task_id)
-    actual_chunk_size = min(max(chunk_size, 256), usable, 1200)
-    if actual_chunk_size < 1:
-        raise ValueError("invalid_chunk_size")
-    chunks = [article[i:i + actual_chunk_size] for i in range(0, len(article), actual_chunk_size)] or [b""]
-    total = len(chunks)
-    digest = hashlib.sha256(article).digest()
+    plan = build_transmission_plan(task_id, article, chunk_size, SEND_WINDOW)
+    total = len(plan.packets)
     deadline_at = (accepted_at if accepted_at is not None else time.monotonic()) + deadline_ms / 1000
 
     def meta_packet():
         remaining_ms = max(1, int((deadline_at - time.monotonic()) * 1000))
-        meta = META.pack(len(article), remaining_ms, actual_chunk_size, digest)
-        return encode_frame(META_FRAME, task_id, 0, total, meta)
+        return plan.metadata(task_id, remaining_ms)
     while UDP_PEER_ADDR is None and time.monotonic() < deadline_at:
         await asyncio.sleep(0.1)
     if UDP_PEER_ADDR is None:
         raise RuntimeError("udp_peer_host_unavailable")
     queue = asyncio.Queue(maxsize=64)
     sent_bytes = 0
+    data_bytes = 0
+    control_bytes = 0
+    retransmit_bytes = 0
+    transmitted_sequences = set()
+    ack_timeout = ACK_TIMEOUT_SECONDS
 
-    def send_limited(packet):
-        nonlocal sent_bytes
+    def send_limited(packet, sequence=None):
+        nonlocal sent_bytes, data_bytes, control_bytes, retransmit_bytes
         if sent_bytes + len(packet) > SENDER_BUDGET_BYTES:
             return False
         send_packet(sender_protocol, packet)
         sent_bytes += len(packet)
+        if sequence is None:
+            control_bytes += len(packet)
+        else:
+            data_bytes += len(packet)
+            if sequence in transmitted_sequences:
+                retransmit_bytes += len(packet)
+            transmitted_sequences.add(sequence)
         return True
 
     sender_protocol.ack_queues[task_id] = queue
     try:
         async with sender_lock:
+            if time.monotonic() >= deadline_at:
+                return
             if not send_limited(meta_packet()):
                 return
             await asyncio.sleep(0.02)
@@ -430,6 +539,7 @@ async def send_article(task_id, article, chunk_size, deadline_ms, accepted_at=No
             for start in range(0, total, SEND_WINDOW):
                 count = min(SEND_WINDOW, total - start)
                 pending = set(range(start, start + count))
+                metadata_confirmed = False
                 for attempt in range(MAX_BATCH_ATTEMPTS):
                     if time.monotonic() >= deadline_at:
                         return
@@ -437,33 +547,69 @@ async def send_article(task_id, article, chunk_size, deadline_ms, accepted_at=No
                         return
                     await asyncio.sleep(0.015)
                     for index in sorted(pending):
-                        packet = make_data_packet(task_id, index, total, chunks[index])
-                        if not send_limited(packet):
+                        if not send_limited(plan.packets[index], sequence=index):
                             return
                         await asyncio.sleep(0.002)
                     query = encode_frame(ACK_QUERY_FRAME, task_id, start, total,
                                          ACK_QUERY.pack(count))
-                    if not send_limited(query):
-                        return
-                    bitmap = await await_batch_ack(protocol=sender_protocol, task_id=task_id,
-                                                   start=start, count=count,
-                                                   timeout=min(ACK_TIMEOUT_SECONDS, max(0.1, deadline_at - time.monotonic())))
-                    if bitmap is not None:
-                        pending = {index for index in range(start, start + count)
-                                   if not bitmap_has(bitmap, index - start)}
-                        if not pending:
-                            break
+                    # Re-query state before replaying data: lost feedback is not evidence of lost data.
+                    for query_attempt in range(2):
+                        if time.monotonic() >= deadline_at or not send_limited(query):
+                            return
+                        queried_at = time.monotonic()
+                        receipt = await await_batch_ack(protocol=sender_protocol, task_id=task_id,
+                            start=start, count=count, total=total,
+                            timeout=min(ack_timeout, max(0.01, deadline_at - time.monotonic())))
+                        if receipt is not None:
+                            bitmap, has_metadata = receipt
+                            metadata_confirmed = metadata_confirmed or has_metadata
+                            pending.difference_update(index for index in range(start, start + count)
+                                                      if bitmap_has(bitmap, index - start))
+                            sample = time.monotonic() - queried_at
+                            ack_timeout = min(3.0, max(0.4, 0.75 * ack_timeout + 0.25 * sample * 2.5))
+                            if not pending and metadata_confirmed:
+                                break
+                            if not has_metadata and not send_limited(meta_packet()):
+                                return
+                        await asyncio.sleep(min(0.03, max(0, deadline_at - time.monotonic())))
+                    if not pending and metadata_confirmed:
+                        break
                     await asyncio.sleep(min(0.1 * (attempt + 1), max(0, deadline_at - time.monotonic())))
     finally:
         sender_protocol.ack_queues.pop(task_id, None)
+        logger.info("transport task=%s mode=%s packets=%s planned_bytes=%s sent_bytes=%s "
+                    "data_bytes=%s control_bytes=%s retransmit_bytes=%s",
+                    task_id, plan.mode, total, plan.estimated_bytes, sent_bytes,
+                    data_bytes, control_bytes, retransmit_bytes)
 
 
 async def sender_job(task_id, article, chunk_size, deadline_ms, accepted_at):
     try:
         with telemetry.session(task_id, "sender_transport", os.getenv("CHALLENGE_SESSION_ID")):
             with task() as span:
-                await send_article(task_id, article, chunk_size, deadline_ms, accepted_at)
-                span.result({"task_id": task_id, "article_bytes": len(article)})
+                raw_payload = (pack_source(article.decode("utf-8"), len(article), encoded=False).encode("utf-8")
+                               if article.startswith(PACKET_PREFIX.encode("ascii")) else article)
+                payload = raw_payload
+                remaining = accepted_at + deadline_ms / 1000 - time.monotonic()
+                mode = os.getenv("SEMANTIC_MODE", "aggressive").strip().lower()
+                if mode != "lossless" and len(article) >= 1024 and remaining > 30:
+                    try:
+                        encoding_deadline = time.monotonic() + remaining * 0.48
+                        candidate = await call_model(article.decode("utf-8"), False,
+                                                     encoding_deadline, purpose="sender")
+                        raw_plan = build_transmission_plan(task_id, raw_payload, chunk_size, SEND_WINDOW)
+                        semantic_plan = build_transmission_plan(task_id, candidate, chunk_size, SEND_WINDOW)
+                        if semantic_plan.estimated_bytes >= raw_plan.estimated_bytes * 0.96:
+                            logger.info("sender agent action=lossless predicted_semantic=%s predicted_lossless=%s",
+                                        semantic_plan.estimated_bytes, raw_plan.estimated_bytes)
+                        else:
+                            payload = candidate
+                    except Exception as exc:
+                        payload = raw_payload
+                        logger.warning("sender agent action=lossless_fallback reason=%s", type(exc).__name__)
+                await send_article(task_id, payload, chunk_size, deadline_ms, accepted_at)
+                span.result({"task_id": task_id, "article_bytes": len(article),
+                             "transport_source_bytes": len(payload), "semantic_encoded": payload != raw_payload})
     except Exception as exc:
         logger.exception("sender job failed for task %s: %s", task_id, type(exc).__name__)
     finally:

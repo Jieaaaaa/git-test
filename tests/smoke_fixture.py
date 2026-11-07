@@ -10,12 +10,15 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-stats = {"model_calls": 0, "udp_bytes": 0, "max_datagram": 0, "dropped": 0}
+stats = {"model_calls": 0, "sender_model_calls": 0, "udp_bytes": 0, "max_datagram": 0, "dropped": 0,
+         "data_dropped": 0, "ack_dropped": 0}
 lock = threading.Lock()
 
 
 def encode_facts(text):
     facts = re.findall(r"Agency(\d+) received (\d+) units in (\d+)", text)
+    if not facts:
+        facts = re.findall(r"Agency(\d+): (\d+) units in (\d+)", text)
     return "; ".join("Agency%s: %s units in %s; alternative rejected" % fact for fact in facts) or "No additional facts."
 
 
@@ -29,7 +32,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         system, user = [message["content"] for message in body["messages"]]
-        if "Audit the factual" in system:
+        if "You verify a semantic" in system:
+            verdict = "reject" if os.getenv("SMOKE_CRITIC_REJECT") == "1" else "accept"
+            content = json.dumps({"verdict": verdict, "repairs": [], "risk": "local fixture decision"})
+        elif "sending semantic communication agent" in system:
+            target = user.split("TARGET SECTION:\n", 1)[1].split("\n\nTOOL OBSERVATION", 1)[0]
+            content = json.dumps({"strategy": "entity ledger", "content": encode_facts(target), "risk": "none"})
+        elif "Act as a semantic communication agent" in system:
+            source = user.split("SOURCE:\n", 1)[1].split("\n\nCURRENT RECORD", 1)[0]
+            content = json.dumps({"action": "propose", "strategy": "entity ledger", "content": encode_facts(source)})
+        elif "Audit the factual" in system:
             content = '{"patches":[]}'
         elif "independent, concise coverage" in system:
             pieces = re.split(r"SECTION \d+:\n", user)[1:]
@@ -40,6 +52,8 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(0.1)
         with lock:
             stats["model_calls"] += 1
+            if "sending semantic communication agent" in system:
+                stats["sender_model_calls"] += 1
         self.respond({"id": "local-mock", "object": "chat.completion", "created": int(time.time()),
                       "model": body["model"], "choices": [{"index": 0, "finish_reason": "stop",
                       "message": {"role": "assistant", "content": content}}],
@@ -58,14 +72,29 @@ def relay(port, target, seed):
     rng = random.Random(seed)
     transport = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     transport.bind(("0.0.0.0", port))
+    packets = 0
+    forced_data_drop = False
+    forced_ack_drop = False
     while True:
         data, address = transport.recvfrom(65536)
+        packets += 1
         with lock:
             stats["udp_bytes"] += len(data)
             stats["max_datagram"] = max(stats["max_datagram"], len(data))
-        if rng.random() < float(os.getenv("SMOKE_LOSS", "0.12")):
+        kind = data[5] if len(data) >= 6 else 0
+        force_data = os.getenv("SMOKE_DROP_DATA") == "1" and kind in (2, 5, 7) and not forced_data_drop
+        force_ack = os.getenv("SMOKE_DROP_ACK") == "1" and kind in (4, 8) and not forced_ack_drop
+        if force_data:
+            forced_data_drop = True
+        if force_ack:
+            forced_ack_drop = True
+        if force_data or force_ack or packets == 2 or rng.random() < float(os.getenv("SMOKE_LOSS", "0.12")):
             with lock:
                 stats["dropped"] += 1
+                if kind in (2, 5, 7):
+                    stats["data_dropped"] += 1
+                if kind in (4, 8):
+                    stats["ack_dropped"] += 1
             continue
         delay = rng.uniform(0.01, 0.07)
         threading.Timer(delay, transport.sendto, args=(data, (target, 9000))).start()

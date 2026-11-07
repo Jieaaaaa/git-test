@@ -134,6 +134,17 @@ class ModelWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "no_complete_model_coverage"):
             await self.generate(request)
 
+    async def test_receiver_can_validate_already_encoded_dense_facts(self):
+        async def request(messages, tokens, budget):
+            if "Audit the factual" in messages[0]["content"]:
+                return '{"patches":[]}'
+            return "A:12 units,2025; B:not approved."
+
+        with patch("semantic_model.request_budget", self.budget):
+            result = await generate_record("A:12 units,2025; B:not approved.", False,
+                                           time.monotonic() + 1, request, allow_verbatim=True)
+        self.assertEqual(result, "A:12 units,2025; B:not approved.")
+
     async def test_fast_server_failure_gets_one_retry(self):
         class ServerError(Exception):
             status_code = 503
