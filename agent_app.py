@@ -23,6 +23,7 @@ from wire import (
     ACK_FRAME,
     ACK_QUERY,
     ACK_QUERY_FRAME,
+    COMPRESSED_DATA_FRAME,
     DATA_FRAME,
     META,
     META_FRAME,
@@ -30,8 +31,10 @@ from wire import (
     ack_bitmap,
     bitmap_has,
     decode_frame,
+    decompress_chunk,
     encode_frame,
     max_payload,
+    compress_chunk,
 )
 
 logging.basicConfig(level=os.getenv("AGENTHACK_LOG_LEVEL", "INFO"))
@@ -146,7 +149,7 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             frame = decode_frame(data)
         except FrameError:
             return
-        if frame.kind not in (META_FRAME, DATA_FRAME, ACK_QUERY_FRAME):
+        if frame.kind not in (META_FRAME, DATA_FRAME, COMPRESSED_DATA_FRAME, ACK_QUERY_FRAME):
             return
         if frame.total < 1 or frame.total > MAX_CHUNKS:
             return
@@ -156,7 +159,7 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             self.tasks[frame.task_id] = state
         if frame.kind == META_FRAME:
             self._on_meta(state, frame)
-        elif frame.kind == DATA_FRAME:
+        elif frame.kind in (DATA_FRAME, COMPRESSED_DATA_FRAME):
             self._on_data(state, frame)
         else:
             self._send_ack(state, frame)
@@ -187,12 +190,19 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
         if state.expected_bytes is not None and frame.total != state.total_chunks:
             return
         state.total_chunks = frame.total
-        if state.chunk_size is not None and len(frame.payload) > state.chunk_size:
+        try:
+            payload = decompress_chunk(frame.kind, frame.payload)
+        except FrameError:
             return
+        if state.chunk_size is not None:
+            expected_size = (state.chunk_size if frame.sequence < state.total_chunks - 1
+                             else state.expected_bytes - state.chunk_size * (state.total_chunks - 1))
+            if len(payload) != expected_size:
+                return
         old = state.chunks.get(frame.sequence)
         if old is None:
-            state.chunks[frame.sequence] = frame.payload
-        elif old != frame.payload:
+            state.chunks[frame.sequence] = payload
+        elif old != payload:
             return
         self._maybe_complete(state)
 
@@ -304,39 +314,74 @@ async def call_model(article_text, partial, deadline_at):
         raise RuntimeError("task_deadline_missing")
     remaining = request_budget(deadline_at)
     async with AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=remaining,
-                           max_retries=2) as client:
+                           max_retries=1) as client:
         completeness = (
-            "Some segments are missing. Use every fact present in the received segments, keep missing-segment "
-            "markers as uncertainty boundaries, and do not infer or bridge absent information."
-            if partial else
-            "The article is complete."
+            "Some segments are missing. Extract and preserve every fact present in the received segments, keep "
+            "missing-segment markers as uncertainty boundaries, and never bridge absent information."
+            if partial else "The article is complete."
         )
-        async with asyncio.timeout(remaining):
-            response = await client.chat.completions.create(
-                model=MODEL_NAME,
-                temperature=0,
-                max_tokens=min(5000, max(1400, len(article_text) * 2)),
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Rewrite the article as a dense, self-contained factual record in its original language. "
-                            "This is lossless fact preservation, not a selective summary: include every distinct "
-                            "claim and concrete detail, including low-salience details. Preserve all people, "
-                            "organizations, roles, places, dates, times, quantities, units, named items, events, "
-                            "comparisons, causes, sequence, negation, uncertainty, conditions, exceptions, and "
-                            "who-did-what-to-whom relations. Keep each fact explicit enough to answer a question "
-                            "without reconstructing context. Remove only duplicated statements and non-factual "
-                            "wording; compress sentence form, never merge away distinctions. Do not rank facts by "
-                            "likely question relevance, infer outside facts, add questions or answers, or use a "
-                            "generic overview in place of details. Use short labeled bullets when useful. "
-                            + completeness
-                        ),
-                    },
-                    {"role": "user", "content": article_text},
-                ],
-            )
-    return (response.choices[0].message.content or "").strip()
+        fact_prompt = (
+            "Build a comprehensive evidence ledger from the article, not a summary. Enumerate every distinct "
+            "claim and concrete detail, including minor details. Preserve names, roles, places, dates, times, "
+            "quantities, units, named entities, actions, recipients, comparisons, causes, sequence, negation, "
+            "uncertainty, conditions, and exceptions. Keep facts atomic and explicit. Do not rank facts by likely "
+            "question relevance, infer missing information, or add outside knowledge. Use the source language. "
+            + completeness
+        )
+        fact_ledger = None
+        first_budget = request_budget(deadline_at, fraction=0.72)
+        try:
+            async with asyncio.timeout(first_budget):
+                response = await client.with_options(timeout=first_budget).chat.completions.create(
+                    model=MODEL_NAME,
+                    temperature=0,
+                    max_tokens=min(6000, max(1800, len(article_text) * 2)),
+                    messages=[
+                        {"role": "system", "content": fact_prompt},
+                        {"role": "user", "content": article_text},
+                    ],
+                )
+            fact_ledger = (response.choices[0].message.content or "").strip()
+            if not fact_ledger:
+                fact_ledger = None
+        except Exception as exc:
+            logger.warning("fact-ledger call did not complete: %s", type(exc).__name__)
+
+        final_budget = request_budget(deadline_at)
+        final_prompt = (
+            "Produce the final compact, self-contained factual record B in the source language. First verify the "
+            "draft ledger against the original article line by line. Add every omitted distinct fact, correct any "
+            "distortion, and retain all names, roles, dates, times, quantities, units, relations, negation, "
+            "conditions, uncertainty, and exceptions. Remove only exact repetition and non-factual wording. "
+            "Do not discard a fact because it seems unlikely to be asked. Do not add outside facts, questions, "
+            "answers, or audit commentary. Use concise labeled statements so each fact remains independently "
+            "answerable. " + completeness
+        )
+        user_content = "ORIGINAL ARTICLE:\n" + article_text
+        if fact_ledger:
+            user_content += "\n\nDRAFT FACT LEDGER TO AUDIT:\n" + fact_ledger
+        try:
+            async with asyncio.timeout(final_budget):
+                response = await client.with_options(timeout=final_budget).chat.completions.create(
+                    model=MODEL_NAME,
+                    temperature=0,
+                    max_tokens=min(6000, max(1800, len(article_text) * 2)),
+                    messages=[
+                        {"role": "system", "content": final_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                )
+            final_text = (response.choices[0].message.content or "").strip()
+            if final_text:
+                return final_text
+        except Exception as exc:
+            if not fact_ledger:
+                raise
+            logger.warning("final audit call failed; keeping successful fact ledger: %s",
+                           type(exc).__name__)
+        if fact_ledger:
+            return fact_ledger
+        raise RuntimeError("model_returned_empty_output")
 
 
 def send_packet(protocol, packet):
@@ -348,7 +393,8 @@ def send_packet(protocol, packet):
 
 
 def make_data_packet(task_id, sequence, total, payload):
-    return encode_frame(DATA_FRAME, task_id, sequence, total, payload)
+    kind, encoded = compress_chunk(payload)
+    return encode_frame(kind, task_id, sequence, total, encoded)
 
 
 async def await_batch_ack(protocol, task_id, start, count, timeout):

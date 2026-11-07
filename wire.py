@@ -16,6 +16,7 @@ META_FRAME = 1
 DATA_FRAME = 2
 ACK_QUERY_FRAME = 3
 ACK_FRAME = 4
+COMPRESSED_DATA_FRAME = 5
 
 
 class FrameError(ValueError):
@@ -85,3 +86,27 @@ def ack_bitmap(received, start, count):
 
 def bitmap_has(bitmap, offset):
     return offset // 8 < len(bitmap) and bool(bitmap[offset // 8] & (1 << (offset % 8)))
+
+
+def compress_chunk(payload):
+    compressed = zlib.compress(payload, level=1)
+    if len(compressed) < len(payload):
+        return COMPRESSED_DATA_FRAME, compressed
+    return DATA_FRAME, payload
+
+
+def decompress_chunk(kind, payload, max_output=1200):
+    if kind == DATA_FRAME:
+        if len(payload) > max_output:
+            raise FrameError("chunk_too_large")
+        return payload
+    if kind != COMPRESSED_DATA_FRAME:
+        raise FrameError("invalid_data_frame_kind")
+    try:
+        decoder = zlib.decompressobj()
+        decoded = decoder.decompress(payload, max_output + 1)
+    except zlib.error as exc:
+        raise FrameError("invalid_compressed_chunk") from exc
+    if len(decoded) > max_output or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+        raise FrameError("invalid_compressed_chunk_size")
+    return decoded

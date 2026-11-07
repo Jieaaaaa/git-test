@@ -13,6 +13,11 @@ class ModelPolicyTests(unittest.TestCase):
         budget = request_budget(deadline_at=115, now=100)
         self.assertEqual(budget, 12)
 
+    def test_fractional_phase_budget_leaves_time_for_followup_calls(self):
+        budget = request_budget(deadline_at=220, now=100, fraction=0.72)
+        self.assertEqual(budget, (220 - 100 - FINALIZATION_RESERVE_SECONDS) * 0.72)
+        self.assertLess(budget, request_budget(deadline_at=220, now=100))
+
     def test_budget_expires_after_reserve_is_consumed(self):
         with self.assertRaises(TimeoutError):
             request_budget(deadline_at=103, now=100)
