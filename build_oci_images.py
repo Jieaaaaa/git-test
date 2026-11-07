@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 BASE = ROOT / "agenthack-base-1.1.1"
 DIST = ROOT / "dist"
-FILES = ("agent_app.py", "wire.py")
+FILES = ("agent_app.py", "wire.py", "model_policy.py")
 ROLE_IMAGES = {
     "sender": "semantic-agent-sender:dev",
     "receiver": "semantic-agent-receiver:dev",

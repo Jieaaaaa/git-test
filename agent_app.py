@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 
 from agenthack import AgentRuntime, BaseAgent
 from agenthack.telemetry import task
+from model_policy import request_budget
 
 from wire import (
     ACK_FRAME,
@@ -256,6 +257,7 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
 
     async def _generate(self, state, raw, partial):
         task_type = "semantic_reconstruction_partial" if partial else "semantic_reconstruction"
+        started = time.monotonic()
         try:
             text = raw.decode("utf-8")
             with telemetry.session(state.task_id, task_type,
@@ -271,7 +273,13 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
                 finally:
                     await asyncio.to_thread(telemetry.flush)
         except Exception as exc:
-            logger.warning("model generation failed for task %s: %s", state.task_id, type(exc).__name__)
+            status_code = getattr(exc, "status_code", None)
+            request_id = getattr(exc, "request_id", None)
+            logger.error(
+                "model generation failed task=%s type=%s status=%s request_id=%s elapsed=%.1fs",
+                state.task_id, type(exc).__name__, status_code, request_id,
+                time.monotonic() - started,
+            )
             state.status = "error"
             state.error = "model_call_failed"
 
@@ -292,33 +300,42 @@ async def call_model(article_text, partial, deadline_at):
     api_key = os.getenv("PLATFORM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not base_url or not api_key:
         raise RuntimeError("platform_model_configuration_missing")
-    remaining = 30.0 if deadline_at is None else max(
-        1.0, min(30.0, deadline_at - time.monotonic() - 1.0))
+    if deadline_at is None:
+        raise RuntimeError("task_deadline_missing")
+    remaining = request_budget(deadline_at)
     async with AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=remaining,
-                           max_retries=0) as client:
+                           max_retries=2) as client:
         completeness = (
-            "The received article may be incomplete. State only facts supported by the received text; "
-            "do not infer missing details."
+            "Some segments are missing. Use every fact present in the received segments, keep missing-segment "
+            "markers as uncertainty boundaries, and do not infer or bridge absent information."
             if partial else
-            "The article is complete. Preserve the facts most likely to support precise questions."
+            "The article is complete."
         )
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            temperature=0,
-            max_tokens=1200,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Create a compact, self-contained factual brief from the article. Preserve named entities, "
-                        "roles, dates, places, quantities, comparisons, causal and temporal relations, and important "
-                        "qualifiers or exceptions. Remove repetition and generic framing. Do not add outside facts, "
-                        "questions, answers, or commentary. Use the article's language and plain text. " + completeness
-                    ),
-                },
-                {"role": "user", "content": article_text},
-            ],
-        )
+        async with asyncio.timeout(remaining):
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                temperature=0,
+                max_tokens=min(5000, max(1400, len(article_text) * 2)),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Rewrite the article as a dense, self-contained factual record in its original language. "
+                            "This is lossless fact preservation, not a selective summary: include every distinct "
+                            "claim and concrete detail, including low-salience details. Preserve all people, "
+                            "organizations, roles, places, dates, times, quantities, units, named items, events, "
+                            "comparisons, causes, sequence, negation, uncertainty, conditions, exceptions, and "
+                            "who-did-what-to-whom relations. Keep each fact explicit enough to answer a question "
+                            "without reconstructing context. Remove only duplicated statements and non-factual "
+                            "wording; compress sentence form, never merge away distinctions. Do not rank facts by "
+                            "likely question relevance, infer outside facts, add questions or answers, or use a "
+                            "generic overview in place of details. Use short labeled bullets when useful. "
+                            + completeness
+                        ),
+                    },
+                    {"role": "user", "content": article_text},
+                ],
+            )
     return (response.choices[0].message.content or "").strip()
 
 
