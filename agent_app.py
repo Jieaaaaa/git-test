@@ -312,76 +312,83 @@ async def call_model(article_text, partial, deadline_at):
         raise RuntimeError("platform_model_configuration_missing")
     if deadline_at is None:
         raise RuntimeError("task_deadline_missing")
-    remaining = request_budget(deadline_at)
-    async with AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=remaining,
-                           max_retries=1) as client:
+    initial_budget = request_budget(deadline_at)
+    async with AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=initial_budget,
+                           max_retries=0) as client:
         completeness = (
-            "Some segments are missing. Extract and preserve every fact present in the received segments, keep "
-            "missing-segment markers as uncertainty boundaries, and never bridge absent information."
-            if partial else "The article is complete."
+            "The source is incomplete. Preserve every fact present in received segments and do not bridge missing "
+            "segments."
+            if partial else "The source is complete."
         )
-        fact_prompt = (
-            "Build a comprehensive evidence ledger from the article, not a summary. Enumerate every distinct "
-            "claim and concrete detail, including minor details. Preserve names, roles, places, dates, times, "
-            "quantities, units, named entities, actions, recipients, comparisons, causes, sequence, negation, "
-            "uncertainty, conditions, and exceptions. Keep facts atomic and explicit. Do not rank facts by likely "
-            "question relevance, infer missing information, or add outside knowledge. Use the source language. "
-            + completeness
+        compact_prompt = (
+            "Create the lockable factual record B in the source language. Preserve each distinct answer-bearing "
+            "fact, including names, roles, dates, places, quantities, units, actions, relations, causes, sequence, "
+            "negation, uncertainty, conditions, and exceptions. Keep facts explicit, but remove repeated wording, "
+            "narrative transitions, and generic framing. Prefer compact clauses separated by semicolons and terse "
+            "labels such as 'date:', 'actor:', 'action:', 'amount:', 'cause:'. Do not write an introduction or "
+            "conclusion. Aim for less than 80% of the source UTF-8 byte length while retaining all testable facts; "
+            "when that target conflicts with factual coverage, retain the fact. Do not add outside knowledge, "
+            "questions, or answers. " + completeness
         )
-        fact_ledger = None
-        first_budget = request_budget(deadline_at, fraction=0.72)
-        try:
-            async with asyncio.timeout(first_budget):
-                response = await client.with_options(timeout=first_budget).chat.completions.create(
-                    model=MODEL_NAME,
-                    temperature=0,
-                    max_tokens=min(6000, max(1800, len(article_text) * 2)),
-                    messages=[
-                        {"role": "system", "content": fact_prompt},
-                        {"role": "user", "content": article_text},
-                    ],
-                )
-            fact_ledger = (response.choices[0].message.content or "").strip()
-            if not fact_ledger:
-                fact_ledger = None
-        except Exception as exc:
-            logger.warning("fact-ledger call did not complete: %s", type(exc).__name__)
+        max_tokens = min(6000, max(1400, int(len(article_text) * 1.2)))
 
-        final_budget = request_budget(deadline_at)
-        final_prompt = (
-            "Produce the final compact, self-contained factual record B in the source language. First verify the "
-            "draft ledger against the original article line by line. Add every omitted distinct fact, correct any "
-            "distortion, and retain all names, roles, dates, times, quantities, units, relations, negation, "
-            "conditions, uncertainty, and exceptions. Remove only exact repetition and non-factual wording. "
-            "Do not discard a fact because it seems unlikely to be asked. Do not add outside facts, questions, "
-            "answers, or audit commentary. Use concise labeled statements so each fact remains independently "
-            "answerable. " + completeness
-        )
-        user_content = "ORIGINAL ARTICLE:\n" + article_text
-        if fact_ledger:
-            user_content += "\n\nDRAFT FACT LEDGER TO AUDIT:\n" + fact_ledger
-        try:
-            async with asyncio.timeout(final_budget):
-                response = await client.with_options(timeout=final_budget).chat.completions.create(
+        async def request(messages, budget):
+            async with asyncio.timeout(budget):
+                response = await client.with_options(timeout=budget).chat.completions.create(
                     model=MODEL_NAME,
                     temperature=0,
-                    max_tokens=min(6000, max(1800, len(article_text) * 2)),
-                    messages=[
-                        {"role": "system", "content": final_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
+                    max_tokens=max_tokens,
+                    messages=messages,
                 )
-            final_text = (response.choices[0].message.content or "").strip()
-            if final_text:
-                return final_text
+            return (response.choices[0].message.content or "").strip()
+
+        primary = None
+        last_error = None
+        for attempt in range(2):
+            try:
+                budget = request_budget(deadline_at, fraction=0.68 if attempt == 0 else 1.0)
+                primary = await request([
+                    {"role": "system", "content": compact_prompt},
+                    {"role": "user", "content": article_text},
+                ], budget)
+                if primary:
+                    break
+                last_error = RuntimeError("model_returned_empty_output")
+            except Exception as exc:
+                last_error = exc
+                status = getattr(exc, "status_code", None)
+                logger.warning("primary model call attempt=%s type=%s status=%s",
+                               attempt + 1, type(exc).__name__, status)
+                if status in (400, 401, 403) or attempt == 1:
+                    break
+
+        if not primary:
+            if last_error:
+                raise last_error
+            raise RuntimeError("model_returned_empty_output")
+
+        # The first successful model output is always a usable deadline fallback.
+        candidate = primary
+        try:
+            audit_budget = request_budget(deadline_at, fraction=0.5)
+            audit_prompt = (
+                "Audit the draft factual record against the original article. Correct omissions or distortions, "
+                "preserve every distinct answer-bearing detail, and return only the final factual record. Keep the "
+                "source language. Compress repeated words and transitions; target less than 80% of the original "
+                "article's UTF-8 byte length when factual coverage permits. Never remove a distinct fact just to "
+                "meet the size target. Do not add questions, answers, or commentary. " + completeness
+            )
+            audited = await request([
+                {"role": "system", "content": audit_prompt},
+                {"role": "user", "content": "ORIGINAL ARTICLE:\n" + article_text
+                 + "\n\nDRAFT RECORD:\n" + primary},
+            ], audit_budget)
+            if audited and len(audited.encode("utf-8")) < len(candidate.encode("utf-8")):
+                candidate = audited
         except Exception as exc:
-            if not fact_ledger:
-                raise
-            logger.warning("final audit call failed; keeping successful fact ledger: %s",
+            logger.warning("optional model audit unavailable; preserving primary output: %s",
                            type(exc).__name__)
-        if fact_ledger:
-            return fact_ledger
-        raise RuntimeError("model_returned_empty_output")
+        return candidate
 
 
 def send_packet(protocol, packet):
