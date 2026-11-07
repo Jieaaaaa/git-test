@@ -1,0 +1,9 @@
+FROM agenthack/base:1.1.1
+
+ARG AGENT_ROLE
+ENV AGENT_ROLE=${AGENT_ROLE}
+WORKDIR /app
+COPY --chown=agent:agent wire.py agent_app.py ./
+USER agent
+EXPOSE 8080/tcp 9000/udp
+CMD ["python", "/app/agent_app.py"]

@@ -1,0 +1,9 @@
+.git
+.DS_Store
+__pycache__
+*.py[cod]
+.env
+.venv
+tests
+agenthack-base-1.1.1
+dist

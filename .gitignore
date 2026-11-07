@@ -1,0 +1,25 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Container and dataset artifacts
+dist/
+agenthack-base-1.1.1/
+*.tar
+*.tar.gz
+
+# Local machine files
+.DS_Store
+.idea/
+.vscode/
