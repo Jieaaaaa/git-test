@@ -3,7 +3,7 @@
 import time
 
 
-FINALIZATION_RESERVE_SECONDS = 3.0
+FINALIZATION_RESERVE_SECONDS = 8.0
 
 
 def request_budget(deadline_at, now=None, fraction=1.0):

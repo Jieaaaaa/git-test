@@ -13,11 +13,12 @@ from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from openai import AsyncOpenAI
+from openai import APIConnectionError, AsyncOpenAI
 
 from agenthack import AgentRuntime, BaseAgent
 from agenthack.telemetry import task
 from model_policy import request_budget
+from semantic_model import generate_record
 
 from wire import (
     ACK_FRAME,
@@ -48,7 +49,6 @@ peer_resolver_task = None
 SEND_WINDOW = 16
 ACK_TIMEOUT_SECONDS = 1.5
 MAX_BATCH_ATTEMPTS = 5
-PARTIAL_RESULT_MARGIN_SECONDS = 22.0
 SENDER_BUDGET_BYTES = 15 * 1024 * 1024
 RECEIVER_BUDGET_BYTES = 1 * 1024 * 1024
 MAX_CHUNKS = 65536
@@ -179,7 +179,8 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
         state.expected_bytes = expected_bytes
         state.chunk_size = chunk_size
         state.digest = digest
-        state.deadline_at = state.created_at + max(1, deadline_ms) / 1000
+        incoming_deadline = time.monotonic() + max(1, deadline_ms) / 1000
+        state.deadline_at = min(state.deadline_at or incoming_deadline, incoming_deadline)
         if state.finalize_task is None:
             state.finalize_task = asyncio.create_task(self._partial_at_deadline(state))
         self._maybe_complete(state)
@@ -251,10 +252,12 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
 
     async def _partial_at_deadline(self, state):
         deadline = state.deadline_at or (state.created_at + 150)
-        delay = max(0, deadline - time.monotonic() - PARTIAL_RESULT_MARGIN_SECONDS)
+        delay = max(0, (deadline - time.monotonic()) * 0.55)
         await asyncio.sleep(delay)
         async with state.lock:
             if state.status in ("success", "error") or state.model_task is not None:
+                return
+            if not state.chunks:
                 return
             raw = state.partial_content()
             if not raw:
@@ -272,16 +275,35 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             text = raw.decode("utf-8")
             with telemetry.session(state.task_id, task_type,
                                    os.getenv("CHALLENGE_SESSION_ID")):
-                try:
-                    with task() as span:
+                with task() as span:
+                    primary_error = None
+                    try:
                         result = await call_model(text, partial, state.deadline_at)
-                        if not result:
-                            raise RuntimeError("empty_model_output")
-                        span.result(result)
-                        state.content = result
-                        state.status = "success"
-                finally:
-                    await asyncio.to_thread(telemetry.flush)
+                    except Exception as exc:
+                        if not partial:
+                            raise
+                        primary_error = exc
+                        result = None
+                    if partial and len(state.chunks) == state.total_chunks:
+                        complete = state.assembled()
+                        if (len(complete) == state.expected_bytes
+                                and hashlib.sha256(complete).digest() == state.digest):
+                            try:
+                                result = await call_model(complete.decode("utf-8"), False, state.deadline_at)
+                            except Exception as exc:
+                                logger.warning("late complete-source refinement unavailable: %s",
+                                               type(exc).__name__)
+                    if not result:
+                        if primary_error is not None:
+                            raise primary_error
+                        raise RuntimeError("empty_model_output")
+                    span.result(result)
+            # Export the closed task/session before the platform can lock B and stop this process.
+            await asyncio.to_thread(telemetry.flush)
+            if time.monotonic() >= state.deadline_at:
+                raise TimeoutError("finalization_deadline_exceeded")
+            state.content = result
+            state.status = "success"
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
             request_id = getattr(exc, "request_id", None)
@@ -292,6 +314,7 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
             )
             state.status = "error"
             state.error = "model_call_failed"
+            await asyncio.to_thread(telemetry.flush)
 
     def error_received(self, exc):
         logger.debug("receiver UDP error: %s", type(exc).__name__)
@@ -315,80 +338,25 @@ async def call_model(article_text, partial, deadline_at):
     initial_budget = request_budget(deadline_at)
     async with AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=initial_budget,
                            max_retries=0) as client:
-        completeness = (
-            "The source is incomplete. Preserve every fact present in received segments and do not bridge missing "
-            "segments."
-            if partial else "The source is complete."
-        )
-        compact_prompt = (
-            "Create the lockable factual record B in the source language. Preserve each distinct answer-bearing "
-            "fact, including names, roles, dates, places, quantities, units, actions, relations, causes, sequence, "
-            "negation, uncertainty, conditions, and exceptions. Keep facts explicit, but remove repeated wording, "
-            "narrative transitions, and generic framing. Prefer compact clauses separated by semicolons and terse "
-            "labels such as 'date:', 'actor:', 'action:', 'amount:', 'cause:'. Do not write an introduction or "
-            "conclusion. Aim for less than 80% of the source UTF-8 byte length while retaining all testable facts; "
-            "when that target conflicts with factual coverage, retain the fact. Do not add outside knowledge, "
-            "questions, or answers. " + completeness
-        )
-        max_tokens = min(6000, max(1400, int(len(article_text) * 1.2)))
-
-        async def request(messages, budget):
-            async with asyncio.timeout(budget):
-                response = await client.with_options(timeout=budget).chat.completions.create(
-                    model=MODEL_NAME,
-                    temperature=0,
-                    max_tokens=max_tokens,
-                    messages=messages,
-                )
-            return (response.choices[0].message.content or "").strip()
-
-        primary = None
-        last_error = None
-        for attempt in range(2):
+        async def request(messages, max_tokens, budget):
             try:
-                budget = request_budget(deadline_at, fraction=0.68 if attempt == 0 else 1.0)
-                primary = await request([
-                    {"role": "system", "content": compact_prompt},
-                    {"role": "user", "content": article_text},
-                ], budget)
-                if primary:
-                    break
-                last_error = RuntimeError("model_returned_empty_output")
-            except Exception as exc:
-                last_error = exc
-                status = getattr(exc, "status_code", None)
-                logger.warning("primary model call attempt=%s type=%s status=%s",
-                               attempt + 1, type(exc).__name__, status)
-                if status in (400, 401, 403) or attempt == 1:
-                    break
+                async with asyncio.timeout(budget):
+                    response = await client.with_options(timeout=budget).chat.completions.create(
+                        model=MODEL_NAME,
+                        temperature=0,
+                        max_tokens=max_tokens,
+                        messages=messages,
+                    )
+            except APIConnectionError as exc:
+                raise ConnectionError("model_gateway_connection_failed") from exc
+            if not response.choices or response.choices[0].finish_reason != "stop":
+                raise RuntimeError("model_output_incomplete")
+            content = response.choices[0].message.content
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("model_returned_empty_output")
+            return content.strip()
 
-        if not primary:
-            if last_error:
-                raise last_error
-            raise RuntimeError("model_returned_empty_output")
-
-        # The first successful model output is always a usable deadline fallback.
-        candidate = primary
-        try:
-            audit_budget = request_budget(deadline_at, fraction=0.5)
-            audit_prompt = (
-                "Audit the draft factual record against the original article. Correct omissions or distortions, "
-                "preserve every distinct answer-bearing detail, and return only the final factual record. Keep the "
-                "source language. Compress repeated words and transitions; target less than 80% of the original "
-                "article's UTF-8 byte length when factual coverage permits. Never remove a distinct fact just to "
-                "meet the size target. Do not add questions, answers, or commentary. " + completeness
-            )
-            audited = await request([
-                {"role": "system", "content": audit_prompt},
-                {"role": "user", "content": "ORIGINAL ARTICLE:\n" + article_text
-                 + "\n\nDRAFT RECORD:\n" + primary},
-            ], audit_budget)
-            if audited and len(audited.encode("utf-8")) < len(candidate.encode("utf-8")):
-                candidate = audited
-        except Exception as exc:
-            logger.warning("optional model audit unavailable; preserving primary output: %s",
-                           type(exc).__name__)
-        return candidate
+        return await generate_record(article_text, partial, deadline_at, request)
 
 
 def send_packet(protocol, packet):
@@ -420,7 +388,7 @@ async def await_batch_ack(protocol, task_id, start, count, timeout):
     return None
 
 
-async def send_article(task_id, article, chunk_size, deadline_ms):
+async def send_article(task_id, article, chunk_size, deadline_ms, accepted_at=None):
     if sender_protocol is None or sender_protocol.transport is None:
         raise RuntimeError("sender_udp_not_ready")
     usable = max_payload(task_id)
@@ -430,9 +398,12 @@ async def send_article(task_id, article, chunk_size, deadline_ms):
     chunks = [article[i:i + actual_chunk_size] for i in range(0, len(article), actual_chunk_size)] or [b""]
     total = len(chunks)
     digest = hashlib.sha256(article).digest()
-    meta = META.pack(len(article), deadline_ms, actual_chunk_size, digest)
-    meta_packet = encode_frame(META_FRAME, task_id, 0, total, meta)
-    deadline_at = time.monotonic() + deadline_ms / 1000
+    deadline_at = (accepted_at if accepted_at is not None else time.monotonic()) + deadline_ms / 1000
+
+    def meta_packet():
+        remaining_ms = max(1, int((deadline_at - time.monotonic()) * 1000))
+        meta = META.pack(len(article), remaining_ms, actual_chunk_size, digest)
+        return encode_frame(META_FRAME, task_id, 0, total, meta)
     while UDP_PEER_ADDR is None and time.monotonic() < deadline_at:
         await asyncio.sleep(0.1)
     if UDP_PEER_ADDR is None:
@@ -451,10 +422,10 @@ async def send_article(task_id, article, chunk_size, deadline_ms):
     sender_protocol.ack_queues[task_id] = queue
     try:
         async with sender_lock:
-            if not send_limited(meta_packet):
+            if not send_limited(meta_packet()):
                 return
             await asyncio.sleep(0.02)
-            if not send_limited(meta_packet):
+            if not send_limited(meta_packet()):
                 return
             for start in range(0, total, SEND_WINDOW):
                 count = min(SEND_WINDOW, total - start)
@@ -462,7 +433,7 @@ async def send_article(task_id, article, chunk_size, deadline_ms):
                 for attempt in range(MAX_BATCH_ATTEMPTS):
                     if time.monotonic() >= deadline_at:
                         return
-                    if not send_limited(meta_packet):
+                    if not send_limited(meta_packet()):
                         return
                     await asyncio.sleep(0.015)
                     for index in sorted(pending):
@@ -487,11 +458,11 @@ async def send_article(task_id, article, chunk_size, deadline_ms):
         sender_protocol.ack_queues.pop(task_id, None)
 
 
-async def sender_job(task_id, article, chunk_size, deadline_ms):
+async def sender_job(task_id, article, chunk_size, deadline_ms, accepted_at):
     try:
         with telemetry.session(task_id, "sender_transport", os.getenv("CHALLENGE_SESSION_ID")):
             with task() as span:
-                await send_article(task_id, article, chunk_size, deadline_ms)
+                await send_article(task_id, article, chunk_size, deadline_ms, accepted_at)
                 span.result({"task_id": task_id, "article_bytes": len(article)})
     except Exception as exc:
         logger.exception("sender job failed for task %s: %s", task_id, type(exc).__name__)
@@ -537,12 +508,16 @@ async def shutdown():
         sender_transport.close()
     if receiver_transport is not None:
         receiver_transport.close()
+    pending_jobs = []
     if peer_resolver_task is not None and not peer_resolver_task.done():
         peer_resolver_task.cancel()
+        pending_jobs.append(peer_resolver_task)
     for state in receiver_tasks.values():
         for pending in (state.finalize_task, state.model_task):
             if pending and not pending.done():
                 pending.cancel()
+                pending_jobs.append(pending)
+    await asyncio.gather(*pending_jobs, return_exceptions=True)
     await asyncio.to_thread(telemetry.flush)
     await asyncio.to_thread(telemetry.shutdown)
 
@@ -581,7 +556,7 @@ async def send(request: Request):
     if task_id in sender_jobs:
         raise HTTPException(status_code=409, detail={"error": "task_already_accepted"})
     sender_jobs.add(task_id)
-    asyncio.create_task(sender_job(task_id, article, chunk_size, deadline_ms))
+    asyncio.create_task(sender_job(task_id, article, chunk_size, deadline_ms, time.monotonic()))
     return JSONResponse(status_code=202, content={"accepted": True, "task_id": task_id})
 
 

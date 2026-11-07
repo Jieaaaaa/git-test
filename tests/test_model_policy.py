@@ -11,7 +11,7 @@ class ModelPolicyTests(unittest.TestCase):
 
     def test_budget_keeps_only_the_finalization_reserve(self):
         budget = request_budget(deadline_at=115, now=100)
-        self.assertEqual(budget, 12)
+        self.assertEqual(budget, 15 - FINALIZATION_RESERVE_SECONDS)
 
     def test_fractional_phase_budget_leaves_time_for_followup_calls(self):
         budget = request_budget(deadline_at=220, now=100, fraction=0.72)
