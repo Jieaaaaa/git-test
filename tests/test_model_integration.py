@@ -262,6 +262,18 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(encoding_deadline, accepted_at + 120)
         transmit.assert_awaited_once_with("bounded-encoder", source, 512, 120000, accepted_at)
 
+    async def test_default_sender_transmits_losslessly_without_waiting_for_model(self):
+        source = ("Approved in 2025 with conditions. " * 80).encode()
+        accepted_at = time.monotonic()
+        transmit = AsyncMock()
+        encoder = AsyncMock()
+        with patch.dict(os.environ), patch.object(agent_app, "call_model", encoder), \
+                patch.object(agent_app, "send_article", transmit):
+            os.environ.pop("SEMANTIC_MODE", None)
+            await agent_app.sender_job("default-lossless", source, 512, 120000, accepted_at)
+        encoder.assert_not_awaited()
+        transmit.assert_awaited_once_with("default-lossless", source, 512, 120000, accepted_at)
+
     async def test_guide_arriving_first_is_not_source_or_acknowledgement(self):
         from semantic_guide import encode_guide
 
@@ -282,6 +294,48 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         protocol.datagram_received(agent_app.encode_frame(agent_app.GUIDE_FRAME, "guide-first", 0, 1,
             encode_guide(stale_guide)), ("127.0.0.1", 9000))
         self.assertEqual(state.guide["anchors"], [source])
+
+    async def test_stalled_full_source_upgrade_keeps_completed_partial_and_flush_reserve(self):
+        raw = b"The entire received source text."
+        state = agent_app.ReceiverTask("bounded-late-complete", 1, expected_bytes=len(raw),
+            chunk_size=512, digest=hashlib.sha256(raw).digest(), chunks={0: raw},
+            status="processing", deadline_at=time.monotonic() + 8.08)
+        events = []
+        deadlines = []
+
+        async def generate(text, partial, deadline_at, **kwargs):
+            if partial:
+                return "Completed partial-source model record"
+            deadlines.append(deadline_at)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("upgrade_cancelled")
+
+        with patch.object(agent_app, "call_model", AsyncMock(side_effect=generate)), \
+                patch.object(agent_app.telemetry, "flush", side_effect=lambda: events.append("flushed")):
+            await agent_app.ReceiverProtocol({})._generate(state, b"Received fragment", True)
+        self.assertEqual(state.status, "success")
+        self.assertEqual(state.content, "Completed partial-source model record")
+        self.assertTrue(state.partial_result)
+        self.assertLess(deadlines[0], state.deadline_at)
+        self.assertGreater(state.deadline_at - time.monotonic(), 7.8)
+        self.assertEqual(events, ["upgrade_cancelled", "flushed"])
+
+    async def test_completed_partial_skips_upgrade_when_only_flush_reserve_remains(self):
+        raw = b"The entire received source text."
+        state = agent_app.ReceiverTask("late-complete-without-budget", 1, expected_bytes=len(raw),
+            chunk_size=512, digest=hashlib.sha256(raw).digest(), chunks={0: raw},
+            status="processing", deadline_at=time.monotonic() + 7)
+        model = AsyncMock(return_value="Completed partial-source model record")
+        with patch.object(agent_app, "call_model", model), \
+                patch.object(agent_app.telemetry, "flush") as flush:
+            await agent_app.ReceiverProtocol({})._generate(state, b"Received fragment", True)
+        self.assertEqual(state.status, "success")
+        self.assertEqual(state.content, "Completed partial-source model record")
+        self.assertTrue(state.partial_result)
+        model.assert_awaited_once()
+        flush.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

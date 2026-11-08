@@ -37,6 +37,8 @@ class Handler(BaseHTTPRequestHandler):
         elif "fragile-fact sentinel" in system:
             content = json.dumps({"anchors": ["Agency0 received 100 units in 2025."]})
         elif "You verify a semantic" in system:
+            if os.getenv("SMOKE_SLOW_REVIEW") == "1":
+                time.sleep(60)
             verdict = "reject" if os.getenv("SMOKE_CRITIC_REJECT") == "1" else "accept"
             content = json.dumps({"verdict": verdict, "repairs": [], "risk": "local fixture decision"})
         elif "sending semantic communication agent" in system:

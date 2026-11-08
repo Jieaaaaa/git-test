@@ -429,9 +429,18 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
                         if (len(complete) == state.expected_bytes
                                 and hashlib.sha256(complete).digest() == state.digest):
                             try:
-                                result = await call_model(complete.decode("utf-8"), False, state.deadline_at,
-                                                          guide_provider=lambda: state.guide)
-                                used_partial = False
+                                upgrade_budget = request_budget(
+                                    state.deadline_at, fraction=0.5 if result else 1.0)
+                                upgrade_deadline = (state.deadline_at - upgrade_budget
+                                                    if result else state.deadline_at)
+                                # A completed candidate must survive a stalled optional refinement.
+                                async with asyncio.timeout(upgrade_budget):
+                                    refined = await call_model(
+                                        complete.decode("utf-8"), False, upgrade_deadline,
+                                        guide_provider=lambda: state.guide)
+                                if refined:
+                                    result = refined
+                                    used_partial = False
                             except Exception as exc:
                                 logger.warning("late complete-source refinement unavailable: %s",
                                                type(exc).__name__)
@@ -525,7 +534,7 @@ async def call_model(article_text, partial, deadline_at, purpose="receiver", gui
                 raise
             source = SourceView(article_text, byte_size(article_text))
         return await generate_adaptive_record(source.text, partial, deadline_at, request,
-            encoded=source.encoded,
+            encoded=source.encoded, original_bytes=source.original_bytes,
             guide_provider=lambda: validated_guide(guide_provider() if guide_provider else {}, source.text))
 
 
@@ -669,7 +678,7 @@ async def sender_job(task_id, article, chunk_size, deadline_ms, accepted_at):
                                if article.startswith(PACKET_PREFIX.encode("ascii")) else article)
                 payload = raw_payload
                 remaining = deadline_at - time.monotonic()
-                mode = os.getenv("SEMANTIC_MODE", "aggressive").strip().lower()
+                mode = os.getenv("SEMANTIC_MODE", "lossless").strip().lower()
                 if mode != "lossless" and len(article) >= 1024 and remaining > 30:
                     try:
                         encoding_deadline = time.monotonic() + remaining * 0.40

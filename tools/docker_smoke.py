@@ -30,8 +30,9 @@ def get(url, body=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", default="dev")
-    parser.add_argument("--semantic-mode", choices=("aggressive", "lossless"), default="aggressive")
+    parser.add_argument("--semantic-mode", choices=("aggressive", "lossless"), default="lossless")
     parser.add_argument("--critic-reject", action="store_true")
+    parser.add_argument("--slow-review", action="store_true")
     parser.add_argument("--drop-data-ack", action="store_true")
     args = parser.parse_args()
     network = "semantic-smoke-" + uuid.uuid4().hex[:12]
@@ -47,6 +48,8 @@ def main():
                             "-p", "127.0.0.1::8000", "--entrypoint", "python"]
                 if args.critic_reject:
                     command += ["-e", "SMOKE_CRITIC_REJECT=1"]
+                if args.slow_review:
+                    command += ["-e", "SMOKE_SLOW_REVIEW=1"]
                 if args.drop_data_ack:
                     command += ["-e", "SMOKE_DROP_DATA=1", "-e", "SMOKE_DROP_ACK=1"]
             else:
@@ -103,6 +106,7 @@ def main():
             assert stats["data_dropped"] > 0 and stats["ack_dropped"] > 0, stats
         print(json.dumps({"status": "passed", "model": "local mock, not official Gateway",
                           "semantic_mode": args.semantic_mode, "critic_reject": args.critic_reject,
+                          "slow_review": args.slow_review,
                           "elapsed_seconds": round(time.monotonic() - started, 2),
                           "source_bytes": len(article.encode()), "result_bytes": len(content.encode()),
                           **stats}, ensure_ascii=False, indent=2))

@@ -103,8 +103,37 @@ class ModelWorkflowTests(unittest.IsolatedAsyncioTestCase):
         result = await self.generate(request)
         self.assertIn("Model coverage", result)
         self.assertNotIn("Article title", result)
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLess(time.monotonic() - started, 0.45)
         self.assertEqual(len(cancelled), len(split_source(self.article)))
+
+    async def test_completed_section_is_retained_during_backup_convergence(self):
+        sections = split_source(self.article)
+        section_calls = 0
+        cancelled = []
+
+        async def request(messages, tokens, budget):
+            nonlocal section_calls
+            prompt = messages[0]["content"]
+            if "independent, concise coverage" in prompt:
+                return json.dumps({"records": ["Backup section %d" % i for i in range(len(sections))]})
+            if "Audit the factual" in prompt:
+                return '{"patches":[]}'
+            index = section_calls
+            section_calls += 1
+            try:
+                if index == 0:
+                    await asyncio.sleep(0.02)
+                    return "Completed detailed section zero."
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.append(index)
+                raise
+
+        result = await self.generate(request)
+        self.assertTrue(result.startswith("Completed detailed section zero."))
+        self.assertIn("Backup section 1", result)
+        self.assertNotIn("Backup section 0", result)
+        self.assertEqual(len(cancelled), len(sections) - 1)
 
     async def test_audit_failure_keeps_usable_model_records(self):
         async def request(messages, tokens, budget):
@@ -138,12 +167,37 @@ class ModelWorkflowTests(unittest.IsolatedAsyncioTestCase):
         async def request(messages, tokens, budget):
             if "Audit the factual" in messages[0]["content"]:
                 return '{"patches":[]}'
+            self.assertIn("already a dense semantic encoding", messages[0]["content"])
+            self.assertIn("Do not apply another", messages[0]["content"])
+            self.assertNotIn("30-40%", messages[0]["content"])
+            self.assertNotIn("TARGET UTF-8 BYTES", messages[1]["content"])
             return "A:12 units,2025; B:not approved."
 
         with patch("semantic_model.request_budget", self.budget):
             result = await generate_record("A:12 units,2025; B:not approved.", False,
                                            time.monotonic() + 1, request, allow_verbatim=True)
         self.assertEqual(result, "A:12 units,2025; B:not approved.")
+
+    async def test_dense_multisection_coverage_has_no_second_compression_target(self):
+        cancelled = []
+
+        async def request(messages, tokens, budget):
+            prompt = messages[0]["content"]
+            self.assertIn("already a dense semantic encoding", prompt)
+            self.assertNotIn("30-40%", prompt)
+            if "independent, concise coverage" in prompt:
+                return json.dumps({"records": split_source(self.article)})
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        with patch("semantic_model.request_budget", self.budget):
+            result = await generate_record(self.article, False, time.monotonic() + 1, request,
+                                           allow_verbatim=True, audit=False)
+        self.assertTrue(is_verbatim(self.article, result))
+        self.assertEqual(len(cancelled), len(split_source(self.article)))
 
     async def test_fast_server_failure_gets_one_retry(self):
         class ServerError(Exception):

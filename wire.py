@@ -1,6 +1,8 @@
 """Compact, checksummed UDP frames for the challenge data plane."""
 
+import bz2
 import hashlib
+import lzma
 import struct
 import zlib
 from dataclasses import dataclass
@@ -15,8 +17,10 @@ ACK_QUERY = struct.Struct("!H")
 BLOCK_META = struct.Struct("!III32s")
 BLOCK_HEADER = struct.Struct("!IIHHBI16s")
 ACK_STATE = struct.Struct("!HB")
-MAX_BLOCK_BYTES = 8192
+MAX_BLOCK_BYTES = 16384
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
+LZMA_MEMORY_LIMIT = 2 * 1024 * 1024
+LZMA_FILTERS = [{"id": lzma.FILTER_LZMA2, "dict_size": 65536}]
 
 META_FRAME = 1
 DATA_FRAME = 2
@@ -122,6 +126,43 @@ def decompress_chunk(kind, payload, max_output=1200):
     return decoded
 
 
+def compress_block(payload):
+    variants = [(0, payload), (1, zlib.compress(payload, level=9)),
+                (2, bz2.compress(payload, compresslevel=1)),
+                (3, lzma.compress(payload, format=lzma.FORMAT_XZ,
+                                  check=lzma.CHECK_CRC32, filters=LZMA_FILTERS))]
+    return min(variants, key=lambda item: len(item[1]))
+
+
+def decompress_block(codec, encoded, length):
+    """Bound both output and codec working memory before validating the source digest."""
+    if codec == 0:
+        return encoded
+    try:
+        if codec == 1:
+            decoder = zlib.decompressobj()
+            decoded = decoder.decompress(encoded, length + 1)
+            tail = decoder.unconsumed_tail
+        elif codec == 2:
+            # Our codec uses the smallest bzip2 block; reject larger allocation headers.
+            if not encoded.startswith(b"BZh1"):
+                raise FrameError("invalid_bzip2_block_header")
+            decoder = bz2.BZ2Decompressor()
+            decoded = decoder.decompress(encoded, max_length=length + 1)
+            tail = not decoder.needs_input and not decoder.eof
+        elif codec == 3:
+            decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=LZMA_MEMORY_LIMIT)
+            decoded = decoder.decompress(encoded, max_length=length + 1)
+            tail = not decoder.needs_input and not decoder.eof
+        else:
+            raise FrameError("invalid_block_codec")
+    except (zlib.error, OSError, EOFError, lzma.LZMAError) as exc:
+        raise FrameError("invalid_compressed_block") from exc
+    if len(decoded) != length or not decoder.eof or decoder.unused_data or tail:
+        raise FrameError("invalid_compressed_block_tail")
+    return decoded
+
+
 @dataclass(frozen=True)
 class TransmissionPlan:
     packets: tuple
@@ -173,13 +214,12 @@ def build_transmission_plan(task_id, article, suggested_size, window=16):
         chunks = [article[start:start + actual_size] for start in range(0, len(article), actual_size)] or [b""]
         candidate("legacy", [compress_chunk(chunk) for chunk in chunks], actual_size)
     if article:
-        for block_size in (4096, MAX_BLOCK_BYTES):
+        for block_size in (4096, 8192, MAX_BLOCK_BYTES):
             parts = []
             block_count = 0
             for offset in range(0, len(article), block_size):
                 raw = article[offset:offset + block_size]
-                compressed = zlib.compress(raw, level=6)
-                codec, encoded = (1, compressed) if len(compressed) < len(raw) else (0, raw)
+                codec, encoded = compress_block(raw)
                 fragment_size = usable - BLOCK_HEADER.size
                 fragments = [encoded[start:start + fragment_size]
                              for start in range(0, len(encoded), fragment_size)]
@@ -210,7 +250,7 @@ class BlockDecoder:
         offset, length, index, count, codec, encoded_length, digest = BLOCK_HEADER.unpack_from(frame.payload)
         limit = MAX_SOURCE_BYTES if expected_bytes is None else expected_bytes
         if (not 1 <= length <= MAX_BLOCK_BYTES or offset + length > limit
-                or codec not in (0, 1) or not 1 <= encoded_length <= MAX_BLOCK_BYTES
+                or codec not in (0, 1, 2, 3) or not 1 <= encoded_length <= MAX_BLOCK_BYTES
                 or not 1 <= count <= 64 or index >= count or frame.sequence < index
                 or frame.sequence - index + count > self.total):
             raise FrameError("invalid_block_descriptor")
@@ -246,16 +286,7 @@ class BlockDecoder:
         encoded = b"".join(fragments[part] for part in range(count))
         if len(encoded) != encoded_length:
             raise FrameError("incomplete_encoded_block")
-        if codec:
-            try:
-                decoder = zlib.decompressobj()
-                decoded = decoder.decompress(encoded, length + 1)
-            except zlib.error as exc:
-                raise FrameError("invalid_compressed_block") from exc
-            if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
-                raise FrameError("invalid_compressed_block_tail")
-        else:
-            decoded = encoded
+        decoded = decompress_block(codec, encoded, length)
         if len(decoded) != length or hashlib.sha256(decoded).digest()[:16] != digest:
             raise FrameError("block_integrity_check_failed")
         self.blocks[offset] = decoded
