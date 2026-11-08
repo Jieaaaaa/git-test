@@ -22,6 +22,15 @@ def encode_facts(text):
     return "; ".join("Agency%s: %s units in %s; alternative rejected" % fact for fact in facts) or "No additional facts."
 
 
+def encode_packet(text):
+    facts = re.findall(r"Agency(\d+) received (\d+) units in (\d+)", text)
+    if not facts:
+        facts = re.findall(r"Agency(\d+): (\d+) units in (\d+)", text)
+    groups = [{"subject": "Agency" + agency, "facts": [units + " units in " + year,
+               "alternative rejected"]} for agency, units, year in facts]
+    return json.dumps({"groups": groups or [{"subject": "Report", "facts": ["No additional facts"]}]})
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -31,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        system, user = [message["content"] for message in body["messages"]]
+        system, user = [message["content"] for message in body["messages"][:2]]
         if "entity/layout planner" in system:
             content = '{"layout":"ledger","entities":[]}'
         elif "fragile-fact sentinel" in system:
@@ -40,10 +49,23 @@ class Handler(BaseHTTPRequestHandler):
             if os.getenv("SMOKE_SLOW_REVIEW") == "1":
                 time.sleep(60)
             verdict = "reject" if os.getenv("SMOKE_CRITIC_REJECT") == "1" else "accept"
-            content = json.dumps({"verdict": verdict, "repairs": [], "risk": "local fixture decision"})
+            name = re.search(r"Agency\d+", user).group()
+            checks = [{"source_quote": name, "candidate_quote": name}]
+            if "TOOL OBSERVATION:\n" in user:
+                observation = json.loads(user.split("TOOL OBSERVATION:\n", 1)[1])
+                checks += [{**item, "candidate_quotes": ["alternative rejected"]}
+                           for item in observation.get("required_checks", [])]
+            content = json.dumps({"verdict": verdict, "repairs": [], "risk": "local fixture decision",
+                                  "checks": checks})
         elif "sending semantic communication agent" in system:
             target = user.split("TARGET SECTION:\n", 1)[1].split("\n\nTOOL OBSERVATION", 1)[0]
             content = json.dumps({"strategy": "entity ledger", "content": encode_facts(target), "risk": "none"})
+        elif "FACT_PACKET_V1" in system:
+            if user.startswith("SOURCE:\n"):
+                source = user.split("SOURCE:\n", 1)[1].split("\n\nOPTIONAL SOURCE GUIDE", 1)[0]
+            else:
+                source = user.split("TARGET SECTION:\n", 1)[1].split("\nFOLLOWING CONTEXT", 1)[0]
+            content = encode_packet(source)
         elif "Act as a semantic communication agent" in system:
             source = user.split("SOURCE:\n", 1)[1].split("\n\nCURRENT RECORD", 1)[0]
             content = json.dumps({"action": "propose", "strategy": "entity ledger", "content": encode_facts(source)})

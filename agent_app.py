@@ -18,6 +18,7 @@ from openai import APIConnectionError, AsyncOpenAI
 from agenthack import AgentRuntime, BaseAgent
 from agenthack.telemetry import task
 from model_policy import request_budget
+from fact_ledger import parse_groups
 from semantic_agent import (PACKET_PREFIX, SourceView, byte_size, encode_for_transport,
                             pack_source, unpack_source)
 from semantic_receiver import generate_adaptive_record
@@ -366,17 +367,10 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
                     self._generate(state, content, partial=False))
             return
 
-        # A partial result may have been published just before the final
-        # retransmission arrived.  Re-open the task and let the complete
-        # source get one grounded model pass; this replaces the provisional
-        # result without starting duplicate upgrades for later duplicate UDP
-        # frames.
+        # Once a result is published it can already be locked by the platform.
+        # Late packets must not turn that success back into a pending/error state.
+        # A complete source arriving during generation is upgraded inside _generate.
         if state.status == "success":
-            if state.partial_result:
-                state.status = "processing"
-                state.partial_result = False
-                state.model_task = asyncio.create_task(
-                    self._generate(state, content, partial=False))
             return
         if state.model_task is not None:
             return
@@ -409,6 +403,13 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
     async def _generate(self, state, raw, partial):
         task_type = "semantic_reconstruction_partial" if partial else "semantic_reconstruction"
         started = time.monotonic()
+        completed_checkpoint = None
+
+        def checkpoint(content):
+            nonlocal completed_checkpoint
+            if isinstance(content, str) and content.strip():
+                completed_checkpoint = content
+
         try:
             text = raw.decode("utf-8")
             with telemetry.session(state.task_id, task_type,
@@ -417,17 +418,29 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
                     primary_error = None
                     try:
                         result = await call_model(text, partial, state.deadline_at,
-                                                  guide_provider=lambda: state.guide)
+                                                  guide_provider=lambda: state.guide,
+                                                  on_checkpoint=checkpoint)
                     except Exception as exc:
-                        if not partial:
+                        if completed_checkpoint:
+                            result = completed_checkpoint
+                            logger.warning("keeping completed model fact checkpoint after %s", type(exc).__name__)
+                        elif not partial:
                             raise
-                        primary_error = exc
-                        result = None
+                        else:
+                            primary_error = exc
+                            result = None
                     used_partial = partial
                     if partial and len(state.chunks) == state.total_chunks:
                         complete = state.assembled()
                         if (len(complete) == state.expected_bytes
                                 and hashlib.sha256(complete).digest() == state.digest):
+                            upgrade_checkpoint = None
+
+                            def checkpoint_upgrade(content):
+                                nonlocal upgrade_checkpoint
+                                if isinstance(content, str) and content.strip():
+                                    upgrade_checkpoint = content
+
                             try:
                                 upgrade_budget = request_budget(
                                     state.deadline_at, fraction=0.5 if result else 1.0)
@@ -437,11 +450,17 @@ class ReceiverProtocol(asyncio.DatagramProtocol):
                                 async with asyncio.timeout(upgrade_budget):
                                     refined = await call_model(
                                         complete.decode("utf-8"), False, upgrade_deadline,
-                                        guide_provider=lambda: state.guide)
+                                        guide_provider=lambda: state.guide,
+                                        on_checkpoint=checkpoint_upgrade)
                                 if refined:
                                     result = refined
                                     used_partial = False
                             except Exception as exc:
+                                if not result and upgrade_checkpoint:
+                                    result = upgrade_checkpoint
+                                    used_partial = False
+                                    logger.warning("keeping completed full-source checkpoint after %s",
+                                                   type(exc).__name__)
                                 logger.warning("late complete-source refinement unavailable: %s",
                                                type(exc).__name__)
                     if not result:
@@ -481,7 +500,8 @@ receiver_tasks = {}
 receiver_transport = None
 
 
-async def call_model(article_text, partial, deadline_at, purpose="receiver", guide_provider=None):
+async def call_model(article_text, partial, deadline_at, purpose="receiver", guide_provider=None,
+                     on_checkpoint=None):
     base_url = os.getenv("PLATFORM_LLM_URL") or os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("PLATFORM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not base_url or not api_key:
@@ -519,6 +539,14 @@ async def call_model(article_text, partial, deadline_at, purpose="receiver", gui
                     raise RuntimeError("model_returned_empty_output")
                 if choice.finish_reason == "stop":
                     return content.strip()
+                if (choice.finish_reason == "length" and "FACT_PACKET_V1" in messages[0]["content"]):
+                    try:
+                        parse_groups(content)
+                    except ValueError:
+                        pass
+                    else:
+                        logger.info("keeping a structurally complete model fact packet at token limit")
+                        return content.strip()
                 if choice.finish_reason != "length" or attempt:
                     raise RuntimeError("model_output_truncated")
                 logger.warning("model output reached token limit; retrying with a larger output ceiling")
@@ -535,6 +563,7 @@ async def call_model(article_text, partial, deadline_at, purpose="receiver", gui
             source = SourceView(article_text, byte_size(article_text))
         return await generate_adaptive_record(source.text, partial, deadline_at, request,
             encoded=source.encoded, original_bytes=source.original_bytes,
+            on_checkpoint=on_checkpoint,
             guide_provider=lambda: validated_guide(guide_provider() if guide_provider else {}, source.text))
 
 

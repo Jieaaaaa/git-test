@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import time
 import unittest
@@ -66,12 +67,13 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         message=SimpleNamespace(content="Partial record"))])
                 return SimpleNamespace(choices=[SimpleNamespace(
                     finish_reason="stop",
-                    message=SimpleNamespace(content="Complete model record"))])
+                    message=SimpleNamespace(content=json.dumps({"groups": [
+                        {"subject": "Record", "facts": ["Complete model record"]}]})))])
 
         with patch.dict(os.environ, {"PLATFORM_LLM_URL": "http://unused/v1", "PLATFORM_API_KEY": "test"}), \
                 patch.object(agent_app, "AsyncOpenAI", FakeClient):
             result = await agent_app.call_model("Received source text", False, time.monotonic() + 20)
-        self.assertEqual(result, "Complete model record")
+        self.assertIn("Complete model record", result)
         self.assertGreaterEqual(FakeClient.calls, 2)
 
     async def test_success_is_published_after_session_close_and_flush(self):
@@ -138,24 +140,43 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(state.model_task)
         await state.model_task
 
-    async def test_complete_source_reopens_published_partial_result(self):
+    async def test_late_complete_source_never_reopens_a_published_result(self):
         raw = b"A complete source fragment."
         state = agent_app.ReceiverTask(
             "partial-upgrade-test", 1, expected_bytes=len(raw), chunk_size=len(raw),
             digest=hashlib.sha256(raw).digest(), chunks={0: raw}, status="success",
             content="Partial record", partial_result=True)
-        generated = asyncio.Event()
-
-        async def fake_generate(*args, **kwargs):
-            generated.set()
-
         protocol = agent_app.ReceiverProtocol({state.task_id: state})
-        with patch.object(agent_app.ReceiverProtocol, "_generate", fake_generate):
+        with patch.object(agent_app.ReceiverProtocol, "_generate", AsyncMock()) as generate:
             protocol._maybe_complete(state)
-            await asyncio.wait_for(generated.wait(), 0.1)
-        self.assertEqual(state.status, "processing")
-        self.assertFalse(state.partial_result)
-        await state.model_task
+        self.assertEqual(state.status, "success")
+        self.assertEqual(state.content, "Partial record")
+        self.assertTrue(state.partial_result)
+        generate.assert_not_awaited()
+
+    async def test_structurally_complete_fact_packet_is_kept_at_token_limit(self):
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.chat = SimpleNamespace(completions=self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            def with_options(self, **kwargs):
+                return self
+
+            async def create(self, **kwargs):
+                return SimpleNamespace(choices=[SimpleNamespace(finish_reason="length",
+                    message=SimpleNamespace(content='{"groups":[{"subject":"Alpha","facts":["12 units in 2025"]}]}'))])
+
+        with patch.dict(os.environ, {"PLATFORM_LLM_URL": "http://unused/v1", "PLATFORM_API_KEY": "test"}), \
+                patch.object(agent_app, "AsyncOpenAI", FakeClient):
+            result = await agent_app.call_model("Alpha received 12 units in 2025", False,
+                                                 time.monotonic() + 20)
+        self.assertEqual(result, "Alpha: 12 units in 2025")
 
     async def test_late_full_source_improves_partial_model_candidate(self):
         for partial_result, full_result, expected in (
@@ -196,8 +217,8 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 FakeClient.calls += 1
                 if FakeClient.calls == 1:
                     raise agent_app.APIConnectionError(request=httpx.Request("POST", "http://unused/v1"))
-                content = ('{"patches":[]}' if "Audit the factual" in kwargs["messages"][0]["content"]
-                           else "Model-generated record following retry.")
+                content = json.dumps({"groups": [{"subject": "Record",
+                    "facts": ["Model-generated record following retry."]}]})
                 return SimpleNamespace(choices=[SimpleNamespace(
                     finish_reason="stop", message=SimpleNamespace(content=content))])
 
@@ -335,6 +356,60 @@ class ClientAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.content, "Completed partial-source model record")
         self.assertTrue(state.partial_result)
         model.assert_awaited_once()
+        flush.assert_called_once()
+
+    async def test_completed_packet_checkpoint_survives_later_orchestration_failure(self):
+        state = agent_app.ReceiverTask("checkpoint-survival", 1, status="processing",
+                                       deadline_at=time.monotonic() + 20)
+
+        async def model(*args, **kwargs):
+            kwargs["on_checkpoint"]("Alpha:12 units in 2025")
+            raise TimeoutError("another model path stalled")
+
+        with patch.object(agent_app, "call_model", model), patch.object(agent_app.telemetry, "flush") as flush:
+            await agent_app.ReceiverProtocol({})._generate(state, b"Alpha received 12 units in 2025", False)
+        self.assertEqual(state.status, "success")
+        self.assertEqual(state.content, "Alpha:12 units in 2025")
+        flush.assert_called_once()
+
+    async def test_full_source_upgrade_checkpoint_survives_when_partial_generation_failed(self):
+        raw = b"Alpha received 12 units in 2025. Beta received 20 units."
+        state = agent_app.ReceiverTask("upgrade-checkpoint-survival", 1, expected_bytes=len(raw),
+            chunk_size=512, digest=hashlib.sha256(raw).digest(), chunks={0: raw},
+            status="processing", deadline_at=time.monotonic() + 20)
+
+        async def model(text, partial, deadline_at, **kwargs):
+            if partial:
+                raise RuntimeError("partial source generation failed")
+            self.assertEqual(text, raw.decode())
+            kwargs["on_checkpoint"]("Alpha:12 units in 2025")
+            raise TimeoutError("later full-source path stalled")
+
+        with patch.object(agent_app, "call_model", model), patch.object(agent_app.telemetry, "flush") as flush:
+            await agent_app.ReceiverProtocol({})._generate(state, b"Alpha received", True)
+        self.assertEqual(state.status, "success")
+        self.assertEqual(state.content, "Alpha:12 units in 2025")
+        self.assertFalse(state.partial_result)
+        flush.assert_called_once()
+
+    async def test_failed_upgrade_checkpoint_does_not_replace_existing_partial_result(self):
+        raw = b"Alpha received 12 units in 2025. Beta received 20 units."
+        state = agent_app.ReceiverTask("upgrade-checkpoint-keeps-prior", 1, expected_bytes=len(raw),
+            chunk_size=512, digest=hashlib.sha256(raw).digest(), chunks={0: raw},
+            status="processing", deadline_at=time.monotonic() + 20)
+        partial_record = "Alpha:12 units in 2025; Beta:20 units"
+
+        async def model(text, partial, deadline_at, **kwargs):
+            if partial:
+                return partial_record
+            kwargs["on_checkpoint"]("Alpha:12 units in 2025")
+            raise TimeoutError("later full-source path stalled")
+
+        with patch.object(agent_app, "call_model", model), patch.object(agent_app.telemetry, "flush") as flush:
+            await agent_app.ReceiverProtocol({})._generate(state, b"Received fragment", True)
+        self.assertEqual(state.status, "success")
+        self.assertEqual(state.content, partial_record)
+        self.assertTrue(state.partial_result)
         flush.assert_called_once()
 
 if __name__ == "__main__":
