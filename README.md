@@ -16,6 +16,8 @@
 - 赛事要求提交两个独立的 Linux/AMD64 OCI/Docker 镜像：Sender 和 Receiver。基础镜像不能直接提交。
 - 实现时应以平台当前冻结版规则、实际注入参数和官方 SDK 为准。规则有更新时，先更新本文的版本记录和本节要点。
 
+当前提交候选为 `3eadc2b`，已推送 GitHub 并导出两个 TAR；91 项容器测试和四种本地 smoke 均通过。新镜像尚未上传、未创建正式评测，当前浏览器控制工具不可用。镜像校验值、上传进度与版本对应关系见 [候选记录](docs/evaluations.md#候选-3eadc2b待上传未创建评测)。正式得分仍未知，80 分是目标。
+
 当前运行模块包括 `agent_app.py`、`wire.py`、`model_policy.py`、`semantic_model.py`、`semantic_agent.py`、`semantic_guide.py` 和 `semantic_receiver.py`。默认 `SEMANTIC_MODE=aggressive`：Sender 使用本例文章 A 调用统一模型生成结构化事实记录，再由独立模型按实际来源核验实体、关系、数值、归属、因果、否定和条件；只有候选达到字节收益门槛才发送。语义编码与核验受剩余截止预算的 40% 上限约束，失败或收益不足即回退原文，文章仍只经受控 UDP 中继抵达 Receiver。Sender 不生成隐藏问题或答案。
 
 Receiver 只基于 UDP 实际收到并校验的原文或语义记录。正常路径由一个模型直接生成全局事实账本，再由独立模型核对；实际字节收益不足、审核拒绝、遗漏或调用失败时，才运行忠实重建兜底。这个成功路径把重叠的候选生成收敛到两个有职责的模型阶段，减少无效等待，同时仍让统一模型生成最终 B。数字和否定检查用于发现风险，不作为语义正确的证明。`SEMANTIC_MODE=lossless` 关闭 Sender 语义编码，作为对照运行；Receiver 仍调用统一模型。
