@@ -209,7 +209,7 @@ async def verify_candidate(source, candidate, request, deadline_at, budget_fract
                            require_numeric_accounting=False, allowed_source=None,
                            require_evidence=False, return_review=False):
     budget = request_budget(deadline_at, fraction=budget_fraction)
-    obligations = audit_obligations(source, candidate) if require_evidence else []
+    obligations = audit_obligations(source, candidate) if require_evidence or allowed_source is not None else []
     scope = (
         "You verify a semantic encoding using a SOURCE EXCERPT from a longer article. "
         "The CANDIDATE covers the ENTIRE article, whereas SOURCE contains only your assigned excerpt. "
@@ -242,6 +242,9 @@ async def verify_candidate(source, candidate, request, deadline_at, budget_fract
         '"source_quote":"exact supporting source substring"}]. Account for EVERY remaining numeric gap; '
         'an accept without that accounting is invalid. Do not dismiss dates, thresholds or quantities '
         'as incidental. Prefer compact factual repairs to long explanations.'
+        ' Review ALL tool-listed required_checks source clauses for their full negation, subject and scope; '
+        'repair omissions. A checks array is required only when explicitly requested below. '
+        'Repair table_shape_errors by correcting the shortest unique header phrase from the source.'
         if require_numeric_accounting else "")
     evidence = (
         ' Perform an adversarial source-to-candidate audit: a short table may preserve values but lose '

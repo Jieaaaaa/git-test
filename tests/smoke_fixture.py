@@ -60,12 +60,12 @@ class Handler(BaseHTTPRequestHandler):
         elif "sending semantic communication agent" in system:
             target = user.split("TARGET SECTION:\n", 1)[1].split("\n\nTOOL OBSERVATION", 1)[0]
             content = json.dumps({"strategy": "entity ledger", "content": encode_facts(target), "risk": "none"})
-        elif "FACT_PACKET_V1" in system:
+        elif "FACT_PACKET_V1" in system or "SEMANTIC_LAYOUT_V2" in system:
             if user.startswith("SOURCE:\n"):
                 source = user.split("SOURCE:\n", 1)[1].split("\n\nOPTIONAL SOURCE GUIDE", 1)[0]
             else:
                 source = user.split("TARGET SECTION:\n", 1)[1].split("\nFOLLOWING CONTEXT", 1)[0]
-            content = encode_packet(source)
+            content = encode_facts(source) if "SEMANTIC_LAYOUT_V2" in system else encode_packet(source)
         elif "Act as a semantic communication agent" in system:
             source = user.split("SOURCE:\n", 1)[1].split("\n\nCURRENT RECORD", 1)[0]
             content = json.dumps({"action": "propose", "strategy": "entity ledger", "content": encode_facts(source)})

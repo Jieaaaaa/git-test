@@ -43,6 +43,30 @@ class ProgressiveRecordTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.generate(request), "Grants 2025: Alpha 12 units; Beta 20 units")
         self.assertTrue(any("You verify a semantic" in item for item in calls))
 
+    async def test_plain_compact_record_with_source_grounded_omission_repair(self):
+        async def request(messages, tokens, budget):
+            system = messages[0]["content"]
+            if "You verify a semantic" in system:
+                self.assertIn("No checks array", system)
+                return json.dumps({"verdict": "repair", "repairs": [{"old": "",
+                    "new": "Beta:20 units,2025", "source_quote": "Beta received 20 units in 2025"}]})
+            if "SEMANTIC_LAYOUT_V2" in system:
+                self.assertIn("plain text only", system)
+                return "Alpha:12 units,2025"
+            return packet("Longer factual grant report", "Alpha 12 units in 2025; Beta 20 units in 2025")
+
+        self.assertEqual(await self.generate(request), "Alpha:12 units,2025\nBeta:20 units,2025")
+
+    async def test_simple_audit_still_rejects_unrepaired_invented_value(self):
+        async def request(messages, tokens, budget):
+            if "You verify a semantic" in messages[0]["content"]:
+                return '{"verdict":"accept","repairs":[]}'
+            if "SEMANTIC_LAYOUT_V2" in messages[0]["content"]:
+                return "Alpha 999 units; Beta 20 units,2025"
+            return packet("Valid", "Alpha 12 units; Beta 20 units,2025")
+
+        self.assertEqual(await self.generate(request), "Valid: Alpha 12 units; Beta 20 units,2025")
+
     async def test_rejected_global_uses_already_completed_packets(self):
         async def request(messages, tokens, budget):
             if "You verify a semantic" in messages[0]["content"]:
@@ -80,9 +104,9 @@ class ProgressiveRecordTests(unittest.IsolatedAsyncioTestCase):
             if "You verify a semantic" in messages[0]["content"]:
                 attempts.append(messages)
                 if len(attempts) == 1:
-                    return json.dumps({"verdict": "accept", "repairs": [], "checks": [{
-                        "source_quote": "Alpha", "candidate_quotes": ["fabricated quote"]}]})
-                self.assertIn("VALIDATION TOOL: invalid_critic_evidence", messages[-1]["content"])
+                    return json.dumps({"verdict": "repair", "repairs": [{
+                        "old": "", "new": "Alpha", "source_quote": "fabricated quote"}]})
+                self.assertIn("VALIDATION TOOL: ungrounded_critic_repair", messages[-1]["content"])
                 self.assertEqual(messages[-2]["role"], "assistant")
                 return json.dumps({"verdict": "accept", "repairs": [], "checks": [{
                     "source_quote": "Alpha", "candidate_quotes": ["Alpha 12 units"]}]})
