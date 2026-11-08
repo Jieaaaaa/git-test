@@ -8,7 +8,7 @@ import time
 
 from fact_ledger import parse_groups, render_groups, split_passages, table_shape_errors
 from model_policy import FINALIZATION_RESERVE_SECONDS, request_budget
-from semantic_agent import byte_size, merge_grounded_reviews, numeric_atoms, verify_candidate
+from semantic_agent import audit_obligations, byte_size, numeric_atoms, verify_candidate
 
 
 logger = logging.getLogger("challenge-agent")
@@ -38,8 +38,15 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
     generation_end = started + budget * GENERATION_FRACTION
     selection_end = started + budget * SELECTION_FRACTION
     original_bytes = original_bytes or byte_size(source)
-    passages = split_passages(source, target_chars=400, max_sections=24)
+    scopes = split_passages(source, target_chars=1200, max_sections=3)
+    passages = []
+    scope_sections = []
+    for scope in scopes:
+        sections = split_passages(scope, target_chars=400, max_sections=8)
+        scope_sections.append(list(range(len(passages), len(passages) + len(sections))))
+        passages.extend(sections)
     records = {}
+    reviewed_scopes = {}
     caveat = "Some source ranges are missing; never infer their content. " if partial else ""
     representation = (
         "This source is already a dense semantic encoding. Normalize faithfully, with no further "
@@ -49,7 +56,13 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
         "repetition; keep distinct facts and their identity. Finish the complete JSON within the output budget. ")
 
     def checkpoint():
-        text = render_groups([group for i in sorted(records) for group in records[i]])
+        parts = []
+        for scope_index, sections in enumerate(scope_sections):
+            if scope_index in reviewed_scopes:
+                parts.append(reviewed_scopes[scope_index])
+            else:
+                parts.append(render_groups([group for i in sections if i in records for group in records[i]]))
+        text = "\n".join(part for part in parts if part)
         if text and on_checkpoint:
             on_checkpoint(text)
         return text
@@ -129,17 +142,21 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
             raise RuntimeError("no_complete_model_coverage")
         return result
 
-    async def global_record():
+    async def compact_scope(scope_index):
+        scope = scopes[scope_index]
+        context = (source.splitlines()[0][:160] + "\n"
+                   + (scopes[scope_index - 1][-120:] if scope_index else ""))
+        allowed_source = scope + "\n" + context
         guide = {}
         if guide_provider:
             try:
                 guide = guide_provider()
             except Exception:
                 pass
-        target = max(64, int(byte_size(source) * (1 if encoded else 0.28)))
+        target = max(64, int(byte_size(scope) * (1 if encoded else 0.28)))
         global_instruction = (
             "Normalize all supplied facts without a second summary. " if encoded else
-            "Choose the best whole-article representation: shared rules plus entity rows, a timeline, or "
+            "Choose the best representation for this section: shared rules plus entity rows, a timeline, or "
             "a relationship ledger. Group common constraints ONCE with explicit scope. A table may contain "
             "compact rows with units and column meanings stated. When multiple entities share "
             "fields, define columns and units ONCE in the header, then give each entity one row "
@@ -161,22 +178,31 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
              "not narrative sentences. Declare short aliases once. Keep names, dates, numbers, units, "
              "roles, causal limits, negations, exceptions and all conjunctive conditions. No introduction "
              "or conclusion. Do not calculate new values. Never replace no application with a zero amount. "
+             "TOOL WATCHLIST highlights source exclusions: explicitly preserve each clause with its subject. "
+             "Mentioning a person's job does not preserve that they are NOT the approver. Numbers do not "
+             "preserve that no rate was announced. An exception must state the exact permitted action. "
              "Use at most one short line per entity/event with semicolon-separated facts. "
+             "Alias names, if used, must start with " + ("QA", "QB", "QC")[scope_index]
+             + " to avoid collision with other sections. Define each alias with its full name. "
              "Before returning, scan every source paragraph for omitted distinct facts. "},
-            {"role": "user", "content": "SOURCE:\n" + source + "\n\nOPTIONAL SOURCE GUIDE:\n"
+            {"role": "user", "content": "SOURCE:\n" + scope
+             + "\n\nCONTEXT ONLY (resolve subjects, never encode extra facts):\n"
+             + context
+             + "\n\nOPTIONAL SOURCE GUIDE:\n"
              + json.dumps(guide, ensure_ascii=False) + "\n\nMEASURED TARGET BYTES: " + str(target)},
         ]
+        messages[1]["content"] += "\n\nTOOL WATCHLIST (encode these SOURCE facts):\n" + json.dumps(
+            audit_obligations(scope, "", limit=12), ensure_ascii=False)
         allowed = budget * GLOBAL_FRACTION
         async with asyncio.timeout(allowed):
-            response = await request(messages, min(3200, max(1000, math.ceil(len(source) * 0.55))), allowed)
+            response = await request(messages, min(2200, max(800, math.ceil(len(scope) * 0.65))), allowed)
         # Accept the previous structured format as well for compatible model gateways.
         candidate = (render_groups(parse_groups(response)) if response.lstrip().startswith("{")
                      else response.strip())
         if not candidate:
             raise ValueError("empty_compact_candidate")
 
-        scopes = split_passages(source, target_chars=1000, max_sections=3)
-        async def review_scope(scope):
+        async def review_scope():
             previous = None
             failure = None
 
@@ -184,7 +210,9 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
                 nonlocal previous
                 messages = [dict(message) for message in messages]
                 messages[0]["content"] += (
-                    " Focus on factual correctness, not stylistic equivalence. For a missing fact, "
+                    " This CANDIDATE encodes only the assigned SOURCE section. Additional context "
+                    "resolves referents; do not require facts from that context in CANDIDATE. "
+                    "Focus on factual correctness, not stylistic equivalence. For a missing fact, "
                     "append one terse statement with explicit subject (old empty). Use a nonempty old "
                     "only for a wrong fact and copy it EXACTLY. Audit every tool-listed source exclusion "
                     "and every source paragraph. No checks array or repeated quotations are required. "
@@ -196,8 +224,7 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
                          + ". Your previous JSON could not be applied. Re-audit against SOURCE, "
                          "then return a complete corrected review. Use only real short quotes. "
                          "A table header applies to all rows; do not expand cells unnecessarily. "
-                         "Old targets must be unique; omit no-op replacements. All candidate_quotes "
-                         "must occur AFTER your repairs. Append a missing condition instead of "
+                         "Old targets must be unique; omit no-op replacements. Append a missing condition instead of "
                          "replacing a repeated number or an entire table. Never fabricate evidence."},
                     ]
                 previous = await request(messages, tokens, allowed)
@@ -207,24 +234,35 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
                 try:
                     return await verify_candidate(scope, candidate, reflected_request,
                         selection_end + FINALIZATION_RESERVE_SECONDS, require_numeric_accounting=True,
-                        allowed_source=source, require_evidence=False, return_review=True)
+                        allowed_source=allowed_source, require_evidence=False, return_review=True)
                 except ValueError as exc:
                     if attempt or str(exc) == "critic_rejected_candidate" or not previous:
                         raise
                     failure = str(exc)[:120]
                     logger.info("receiver critic action=repair_validation reason=%s", failure)
 
-        reviews = [asyncio.create_task(review_scope(scope)) for scope in scopes]
+        checked, _ = await review_scope()
+        if table_shape_errors(checked) or numeric_atoms(checked) - numeric_atoms(allowed_source):
+            raise ValueError("invalid_reviewed_compact_section")
+        reviewed_scopes[scope_index] = checked
+        checkpoint()
+        logger.info("receiver compact section ready scope=%s/%s source_bytes=%s result_bytes=%s elapsed=%.1fs",
+                    scope_index + 1, len(scopes), byte_size(scope), byte_size(checked), time.monotonic() - started)
+        return checked
+
+    async def global_record():
+        reviews = [asyncio.create_task(compact_scope(i)) for i in range(len(scopes))]
         try:
-            checked_parts = await asyncio.gather(*reviews)
+            checked_parts = await asyncio.gather(*reviews, return_exceptions=True)
         finally:
             for job in reviews:
                 if not job.done():
                     job.cancel()
             await asyncio.gather(*reviews, return_exceptions=True)
-        checked = merge_grounded_reviews(source, candidate, [review for _, review in checked_parts])
-        if table_shape_errors(checked) or numeric_atoms(checked) - numeric_atoms(source):
-            raise ValueError("invalid_merged_compact_record")
+        failures = [part for part in checked_parts if isinstance(part, BaseException)]
+        if failures:
+            raise failures[0]
+        checked = "\n".join(checked_parts)
         logger.info("receiver global reviewed scopes=%s bytes=%s elapsed=%.1fs",
                     len(scopes), byte_size(checked), time.monotonic() - started)
         return checked
@@ -259,7 +297,7 @@ async def generate_adaptive_record(source, partial, deadline_at, request, encode
                                    str(exc)[:100] if isinstance(exc, ValueError) else "")
             if fallback and compact not in pending:
                 break
-        result = fallback or checkpoint()
+        result = checkpoint() or fallback
         if not result:
             raise RuntimeError("no_complete_model_coverage")
         logger.info("receiver finalized action=fact_packets covered=%s/%s original_bytes=%s "

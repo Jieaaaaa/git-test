@@ -67,6 +67,56 @@ class ProgressiveRecordTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.generate(request), "Valid: Alpha 12 units; Beta 20 units,2025")
 
+    async def test_failed_scope_keeps_other_reviewed_compression(self):
+        checkpoints = []
+
+        def partition(text, target_chars, max_sections):
+            return self.passages if max_sections == 3 else [text]
+
+        async def request(messages, tokens, budget):
+            user = messages[1]["content"]
+            if "You verify a semantic" in messages[0]["content"]:
+                if "SOURCE:\nAlpha" in user:
+                    return '{"verdict":"accept","repairs":[]}'
+                return '{"verdict":"reject","repairs":[]}'
+            if "SEMANTIC_LAYOUT_V2" in messages[0]["content"]:
+                return "Alpha:12 units,2025" if user.startswith("SOURCE:\nAlpha") else "Beta:20 units,2025"
+            await asyncio.sleep(0.01)
+            if "TARGET SECTION:\nAlpha" in user:
+                return packet("Long Alpha report", "received 12 units in 2025")
+            return packet("Long Beta report", "received 20 units in 2025")
+
+        with patch("semantic_receiver.split_passages", side_effect=partition):
+            result = await self.generate(request, on_checkpoint=checkpoints.append)
+        self.assertEqual(result, "Alpha:12 units,2025\nLong Beta report: received 20 units in 2025")
+        self.assertNotIn("Long Alpha report", result)
+        self.assertIn(result, checkpoints)
+
+    async def test_slow_scope_keeps_completed_review_and_cancels_remaining_jobs(self):
+        cancelled = []
+
+        def partition(text, target_chars, max_sections):
+            return self.passages if max_sections == 3 else [text]
+
+        async def request(messages, tokens, budget):
+            user = messages[1]["content"]
+            if "You verify a semantic" in messages[0]["content"]:
+                if "SOURCE:\nAlpha" in user:
+                    return '{"verdict":"accept","repairs":[]}'
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.append(True)
+            if "SEMANTIC_LAYOUT_V2" in messages[0]["content"]:
+                return "Alpha:12 units,2025" if user.startswith("SOURCE:\nAlpha") else "Beta:20 units,2025"
+            return packet("Coverage Alpha" if "TARGET SECTION:\nAlpha" in user else "Coverage Beta",
+                          "12 units,2025" if "TARGET SECTION:\nAlpha" in user else "20 units,2025")
+
+        with patch("semantic_receiver.split_passages", side_effect=partition):
+            result = await self.generate(request)
+        self.assertEqual(result, "Alpha:12 units,2025\nCoverage Beta: 20 units,2025")
+        self.assertTrue(cancelled)
+
     async def test_rejected_global_uses_already_completed_packets(self):
         async def request(messages, tokens, budget):
             if "You verify a semantic" in messages[0]["content"]:
@@ -169,7 +219,8 @@ class ProgressiveRecordTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 active -= 1
 
-        with patch("semantic_receiver.split_passages", return_value=passages):
+        with patch("semantic_receiver.split_passages", side_effect=lambda text, target_chars, max_sections:
+                   [text] if max_sections == 3 else passages):
             result = await generate_adaptive_record("".join(passages), False,
                                                      time.monotonic() + 9, request)
         for i in range(10):
